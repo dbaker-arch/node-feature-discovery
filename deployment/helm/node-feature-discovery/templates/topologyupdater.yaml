@@ -65,6 +65,7 @@ spec:
       - name: host-sys
         hostPath:
           path: "/sys"
+          type: Directory
       - name: kubelet-config
         hostPath:
           {{- if .Values.topologyUpdater.kubeletConfigPath | empty | not }}
@@ -72,6 +73,7 @@ spec:
           {{- else }}
           path: /var/lib/kubelet/config.yaml
           {{- end }}
+          type: File
       - name: kubelet-podresources-sock
         hostPath:
           {{- if .Values.topologyUpdater.kubeletPodResourcesSockPath | empty | not }}
@@ -79,6 +81,8 @@ spec:
           {{- else }}
           path: /var/lib/kubelet/pod-resources/kubelet.sock
           {{- end }}
+          type: Socket
+
     {{- with .Values.topologyUpdater.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

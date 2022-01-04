@@ -87,26 +87,33 @@ spec:
         - name: host-boot
           hostPath:
             path: "/boot"
+            type: Directory
         - name: host-os-release
           hostPath:
             path: "/etc/os-release"
+            type: File
         - name: host-sys
           hostPath:
             path: "/sys"
+            type: Directory
         - name: host-usr-lib
           hostPath:
             path: "/usr/lib"
+            type: Directory
         {{- if .Values.worker.mountUsrSrc }}
         - name: host-usr-src
           hostPath:
             path: "/usr/src"
+            type: Directory
         {{- end }}
         - name: source-d
           hostPath:
             path: "/etc/kubernetes/node-feature-discovery/source.d/"
+            type: DirectoryOrCreate
         - name: features-d
           hostPath:
             path: "/etc/kubernetes/node-feature-discovery/features.d/"
+            type: DirectoryOrCreate
         - name: nfd-worker-conf
           configMap:
             name: {{ include "node-feature-discovery.fullname" . }}-worker-conf
