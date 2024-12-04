@@ -24,8 +24,9 @@ import (
 
 	"k8s.io/klog/v2"
 
-	"sigs.k8s.io/node-feature-discovery/pkg/api/feature"
+	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/api/nfd/v1alpha1"
 	"sigs.k8s.io/node-feature-discovery/pkg/utils"
+	"sigs.k8s.io/node-feature-discovery/pkg/utils/hostpath"
 	"sigs.k8s.io/node-feature-discovery/source"
 )
 
@@ -36,16 +37,18 @@ var osReleaseFields = [...]string{
 	"VERSION_ID.minor",
 }
 
+// Name of this feature source
 const Name = "system"
 
 const (
 	OsReleaseFeature = "osrelease"
 	NameFeature      = "name"
+	DmiIdFeature     = "dmiid"
 )
 
 // systemSource implements the FeatureSource and LabelSource interfaces.
 type systemSource struct {
-	features *feature.DomainFeatures
+	features *nfdv1alpha1.Features
 }
 
 // Singleton source instance
@@ -66,7 +69,7 @@ func (s *systemSource) GetLabels() (source.FeatureLabels, error) {
 	features := s.GetFeatures()
 
 	for _, key := range osReleaseFields {
-		if value, exists := features.Values[OsReleaseFeature].Elements[key]; exists {
+		if value, exists := features.Attributes[OsReleaseFeature].Elements[key]; exists {
 			feature := "os_release." + key
 			labels[feature] = value
 		}
@@ -76,38 +79,54 @@ func (s *systemSource) GetLabels() (source.FeatureLabels, error) {
 
 // Discover method of the FeatureSource interface
 func (s *systemSource) Discover() error {
-	s.features = feature.NewDomainFeatures()
+	s.features = nfdv1alpha1.NewFeatures()
 
 	// Get node name
-	s.features.Values[NameFeature] = feature.NewValueFeatures(nil)
-	s.features.Values[NameFeature].Elements["nodename"] = os.Getenv("NODE_NAME")
+	s.features.Attributes[NameFeature] = nfdv1alpha1.NewAttributeFeatures(nil)
+	s.features.Attributes[NameFeature].Elements["nodename"] = utils.NodeName()
 
 	// Get os-release information
 	release, err := parseOSRelease()
 	if err != nil {
-		klog.Errorf("failed to get os-release: %s", err)
+		klog.ErrorS(err, "failed to get os-release")
 	} else {
-		s.features.Values[OsReleaseFeature] = feature.NewValueFeatures(release)
+		s.features.Attributes[OsReleaseFeature] = nfdv1alpha1.NewAttributeFeatures(release)
 
 		if v, ok := release["VERSION_ID"]; ok {
 			versionComponents := splitVersion(v)
 			for subKey, subValue := range versionComponents {
 				if subValue != "" {
-					s.features.Values[OsReleaseFeature].Elements["VERSION_ID."+subKey] = subValue
+					s.features.Attributes[OsReleaseFeature].Elements["VERSION_ID."+subKey] = subValue
 				}
 			}
 		}
 	}
 
-	utils.KlogDump(3, "discovered system features:", "  ", s.features)
+	// Get DMI ID attributes
+	dmiIDAttributeNames := []string{"sys_vendor", "product_name"}
+	dmiAttrs := make(map[string]string)
+	for _, name := range dmiIDAttributeNames {
+		val, err := getDmiIDAttribute(name)
+		if err != nil {
+			klog.ErrorS(err, "failed to get DMI entry", "attributeName", name)
+		} else {
+			dmiAttrs[name] = val
+		}
+	}
+
+	if len(dmiAttrs) > 0 {
+		s.features.Attributes[DmiIdFeature] = nfdv1alpha1.NewAttributeFeatures(dmiAttrs)
+	}
+
+	klog.V(3).InfoS("discovered features", "featureSource", s.Name(), "features", utils.DelayedDumper(s.features))
 
 	return nil
 }
 
 // GetFeatures method of the FeatureSource Interface
-func (s *systemSource) GetFeatures() *feature.DomainFeatures {
+func (s *systemSource) GetFeatures() *nfdv1alpha1.Features {
 	if s.features == nil {
-		s.features = feature.NewDomainFeatures()
+		s.features = nfdv1alpha1.NewFeatures()
 	}
 	return s.features
 }
@@ -116,7 +135,7 @@ func (s *systemSource) GetFeatures() *feature.DomainFeatures {
 func parseOSRelease() (map[string]string, error) {
 	release := map[string]string{}
 
-	f, err := os.Open(source.EtcDir.Path("os-release"))
+	f, err := os.Open(hostpath.EtcDir.Path("os-release"))
 	if err != nil {
 		return nil, err
 	}
@@ -149,6 +168,16 @@ func splitVersion(version string) map[string]string {
 		}
 	}
 	return components
+}
+
+// Read /sys/devices/virtual/dmi/id attribute
+func getDmiIDAttribute(name string) (string, error) {
+	s, err := os.ReadFile(hostpath.SysfsDir.Path("devices/virtual/dmi/id/", name))
+	if err != nil {
+		return "", err
+	}
+
+	return strings.TrimSpace(string(s)), nil
 }
 
 func init() {

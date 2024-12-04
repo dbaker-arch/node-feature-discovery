@@ -20,17 +20,21 @@ import (
 	"fmt"
 	"strings"
 
+	"golang.org/x/exp/maps"
 	"k8s.io/klog/v2"
 
-	"sigs.k8s.io/node-feature-discovery/pkg/api/feature"
+	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/api/nfd/v1alpha1"
 	"sigs.k8s.io/node-feature-discovery/pkg/utils"
 	"sigs.k8s.io/node-feature-discovery/source"
 )
 
+// Name of this feature source
 const Name = "pci"
 
+// DeviceFeature is the name of the feature set that holds all discovered PCI devices.
 const DeviceFeature = "device"
 
+// Config holds the configuration parameters of this source.
 type Config struct {
 	DeviceClassWhitelist []string `json:"deviceClassWhitelist,omitempty"`
 	DeviceLabelFields    []string `json:"deviceLabelFields,omitempty"`
@@ -47,7 +51,7 @@ func newDefaultConfig() *Config {
 // pciSource implements the FeatureSource, LabelSource and ConfigurableSource interfaces.
 type pciSource struct {
 	config   *Config
-	features *feature.DomainFeatures
+	features *nfdv1alpha1.Features
 }
 
 // Singleton source instance
@@ -73,7 +77,7 @@ func (s *pciSource) SetConfig(conf source.Config) {
 	case *Config:
 		s.config = v
 	default:
-		klog.Fatalf("invalid config type: %T", conf)
+		panic(fmt.Sprintf("invalid config type: %T", conf))
 	}
 }
 
@@ -99,15 +103,11 @@ func (s *pciSource) GetLabels() (source.FeatureLabels, error) {
 		}
 	}
 	if len(configLabelFields) > 0 {
-		keys := []string{}
-		for key := range configLabelFields {
-			keys = append(keys, key)
-		}
-		klog.Warningf("invalid fields (%s) in deviceLabelFields, ignoring...", strings.Join(keys, ", "))
+		klog.InfoS("ignoring invalid fields in deviceLabelFields", "invalidFieldNames", maps.Keys(configLabelFields))
 	}
 	if len(deviceLabelFields) == 0 {
-		klog.Warningf("no valid fields in deviceLabelFields defined, using the defaults")
 		deviceLabelFields = []string{"class", "vendor"}
+		klog.InfoS("no valid fields in deviceLabelFields defined, using the defaults", "defaultFieldNames", deviceLabelFields)
 	}
 
 	// Iterate over all device classes
@@ -137,23 +137,23 @@ func (s *pciSource) GetLabels() (source.FeatureLabels, error) {
 
 // Discover method of the FeatureSource interface
 func (s *pciSource) Discover() error {
-	s.features = feature.NewDomainFeatures()
+	s.features = nfdv1alpha1.NewFeatures()
 
 	devs, err := detectPci()
 	if err != nil {
 		return fmt.Errorf("failed to detect PCI devices: %s", err.Error())
 	}
-	s.features.Instances[DeviceFeature] = feature.NewInstanceFeatures(devs)
+	s.features.Instances[DeviceFeature] = nfdv1alpha1.NewInstanceFeatures(devs...)
 
-	utils.KlogDump(3, "discovered pci features:", "  ", s.features)
+	klog.V(3).InfoS("discovered features", "featureSource", s.Name(), "features", utils.DelayedDumper(s.features))
 
 	return nil
 }
 
 // GetFeatures method of the FeatureSource Interface
-func (s *pciSource) GetFeatures() *feature.DomainFeatures {
+func (s *pciSource) GetFeatures() *nfdv1alpha1.Features {
 	if s.features == nil {
-		s.features = feature.NewDomainFeatures()
+		s.features = nfdv1alpha1.NewFeatures()
 	}
 	return s.features
 }

@@ -19,18 +19,25 @@ package fake
 import (
 	"fmt"
 
-	"sigs.k8s.io/node-feature-discovery/pkg/api/feature"
+	"k8s.io/klog/v2"
+	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/api/nfd/v1alpha1"
 	"sigs.k8s.io/node-feature-discovery/pkg/utils"
 	"sigs.k8s.io/node-feature-discovery/source"
 )
 
+// Name of this feature source
 const Name = "fake"
 
+// FlagFeature of this feature source
 const FlagFeature = "flag"
+
+// AttributeFeature of this feature source
 const AttributeFeature = "attribute"
+
+// InstanceFeature of this feature source
 const InstanceFeature = "instance"
 
-// Configuration file options
+// Config contains the configuration parameters of this source.
 type Config struct {
 	Labels            map[string]string `json:"labels"`
 	FlagFeatures      []string          `json:"flagFeatures"`
@@ -55,20 +62,20 @@ func newDefaultConfig() *Config {
 			"attr_3": "10",
 		},
 		InstanceFeatures: []FakeInstance{
-			FakeInstance{
+			{
 				"name":   "instance_1",
 				"attr_1": "true",
 				"attr_2": "false",
 				"attr_3": "10",
 				"attr_4": "foobar",
 			},
-			FakeInstance{
+			{
 				"name":   "instance_2",
 				"attr_1": "true",
 				"attr_2": "true",
 				"attr_3": "100",
 			},
-			FakeInstance{
+			{
 				"name": "instance_3",
 			},
 		},
@@ -78,7 +85,7 @@ func newDefaultConfig() *Config {
 // fakeSource implements the FeatureSource, LabelSource and ConfigurableSource interfaces.
 type fakeSource struct {
 	config   *Config
-	features *feature.DomainFeatures
+	features *nfdv1alpha1.Features
 }
 
 // Singleton source instance
@@ -110,26 +117,26 @@ func (s *fakeSource) SetConfig(conf source.Config) {
 
 // Discover method of the FeatureSource interface
 func (s *fakeSource) Discover() error {
-	s.features = feature.NewDomainFeatures()
+	s.features = nfdv1alpha1.NewFeatures()
 
-	s.features.Keys[AttributeFeature] = feature.NewKeyFeatures(s.config.FlagFeatures...)
-	s.features.Values[AttributeFeature] = feature.NewValueFeatures(s.config.AttributeFeatures)
+	s.features.Flags[FlagFeature] = nfdv1alpha1.NewFlagFeatures(s.config.FlagFeatures...)
+	s.features.Attributes[AttributeFeature] = nfdv1alpha1.NewAttributeFeatures(s.config.AttributeFeatures)
 
-	instances := make([]feature.InstanceFeature, len(s.config.InstanceFeatures))
+	instances := make([]nfdv1alpha1.InstanceFeature, len(s.config.InstanceFeatures))
 	for i, instanceAttributes := range s.config.InstanceFeatures {
-		instances[i] = *feature.NewInstanceFeature(instanceAttributes)
+		instances[i] = *nfdv1alpha1.NewInstanceFeature(instanceAttributes)
 	}
-	s.features.Instances[InstanceFeature] = feature.NewInstanceFeatures(instances)
+	s.features.Instances[InstanceFeature] = nfdv1alpha1.NewInstanceFeatures(instances...)
 
-	utils.KlogDump(3, "discovered fake features:", "  ", s.features)
+	klog.V(3).InfoS("discovered features", "featureSource", s.Name(), "features", utils.DelayedDumper(s.features))
 
 	return nil
 }
 
 // GetFeatures method of the FeatureSource Interface.
-func (s *fakeSource) GetFeatures() *feature.DomainFeatures {
+func (s *fakeSource) GetFeatures() *nfdv1alpha1.Features {
 	if s.features == nil {
-		s.features = feature.NewDomainFeatures()
+		s.features = nfdv1alpha1.NewFeatures()
 	}
 	return s.features
 }

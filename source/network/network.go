@@ -17,29 +17,38 @@ limitations under the License.
 package network
 
 import (
+	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"k8s.io/klog/v2"
 
-	"sigs.k8s.io/node-feature-discovery/pkg/api/feature"
+	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/api/nfd/v1alpha1"
 	"sigs.k8s.io/node-feature-discovery/pkg/utils"
+	"sigs.k8s.io/node-feature-discovery/pkg/utils/hostpath"
 	"sigs.k8s.io/node-feature-discovery/source"
 )
 
+// Name of this feature source
 const Name = "network"
 
-const DeviceFeature = "device"
+const (
+	// DeviceFeature exposes physical network devices
+	DeviceFeature = "device"
+	// VirtualFeature exposes features for network interfaces that are not attached to a physical device
+	VirtualFeature = "virtual"
+)
 
 const sysfsBaseDir = "class/net"
 
 // networkSource implements the FeatureSource and LabelSource interfaces.
 type networkSource struct {
-	features *feature.DomainFeatures
+	features *nfdv1alpha1.Features
 }
 
 // Singleton source instance
@@ -50,10 +59,11 @@ var (
 )
 
 var (
-	// ifaceAttrs is the list of files under /sys/class/net/<iface> that we're trying to read
-	ifaceAttrs = []string{"operstate", "speed"}
-	// devAttrs is the list of files under /sys/class/net/<iface>/device that we're trying to read
-	devAttrs = []string{"sriov_numvfs", "sriov_totalvfs"}
+	// devIfaceAttrs is the list of files under /sys/class/net/<iface> that we're reading
+	devIfaceAttrs = []string{"operstate", "speed", "device/sriov_numvfs", "device/sriov_totalvfs"}
+
+	// virtualIfaceAttrs is the list of files under /sys/class/net/<iface> that we're reading
+	virtualIfaceAttrs = []string{"operstate", "speed"}
 )
 
 // Name returns an identifier string for this feature source.
@@ -69,9 +79,6 @@ func (s *networkSource) GetLabels() (source.FeatureLabels, error) {
 
 	for _, dev := range features.Instances[DeviceFeature].Elements {
 		attrs := dev.Attributes
-		if attrs["operstate"] != "up" {
-			continue
-		}
 		for attr, feature := range map[string]string{
 			"sriov_totalvfs": "sriov.capable",
 			"sriov_numvfs":   "sriov.configured"} {
@@ -79,7 +86,7 @@ func (s *networkSource) GetLabels() (source.FeatureLabels, error) {
 			if v, ok := attrs[attr]; ok {
 				t, err := strconv.Atoi(v)
 				if err != nil {
-					klog.Errorf("failed to parse %s of %s: %v", attr, attrs["name"])
+					klog.ErrorS(err, "failed to parse sriov attribute", "attributeName", attr, "deviceName", attrs["name"])
 					continue
 				}
 				if t > 0 {
@@ -93,74 +100,71 @@ func (s *networkSource) GetLabels() (source.FeatureLabels, error) {
 
 // Discover method of the FeatureSource interface.
 func (s *networkSource) Discover() error {
-	s.features = feature.NewDomainFeatures()
+	s.features = nfdv1alpha1.NewFeatures()
 
-	devs, err := detectNetDevices()
+	devs, virts, err := detectNetDevices()
 	if err != nil {
 		return fmt.Errorf("failed to detect network devices: %w", err)
 	}
-	s.features.Instances[DeviceFeature] = feature.InstanceFeatureSet{Elements: devs}
+	s.features.Instances[DeviceFeature] = nfdv1alpha1.InstanceFeatureSet{Elements: devs}
+	s.features.Instances[VirtualFeature] = nfdv1alpha1.InstanceFeatureSet{Elements: virts}
 
-	utils.KlogDump(3, "discovered network features:", "  ", s.features)
+	klog.V(3).InfoS("discovered features", "featureSource", s.Name(), "features", utils.DelayedDumper(s.features))
 
 	return nil
 }
 
 // GetFeatures method of the FeatureSource Interface.
-func (s *networkSource) GetFeatures() *feature.DomainFeatures {
+func (s *networkSource) GetFeatures() *nfdv1alpha1.Features {
 	if s.features == nil {
-		s.features = feature.NewDomainFeatures()
+		s.features = nfdv1alpha1.NewFeatures()
 	}
 	return s.features
 }
 
-func detectNetDevices() ([]feature.InstanceFeature, error) {
-	sysfsBasePath := source.SysfsDir.Path(sysfsBaseDir)
+func detectNetDevices() ([]nfdv1alpha1.InstanceFeature, []nfdv1alpha1.InstanceFeature, error) {
+	sysfsBasePath := hostpath.SysfsDir.Path(sysfsBaseDir)
 
-	ifaces, err := ioutil.ReadDir(sysfsBasePath)
+	ifaces, err := os.ReadDir(sysfsBasePath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list network interfaces: %w", err)
+		return nil, nil, fmt.Errorf("failed to list network interfaces: %w", err)
 	}
 
+	ifaces = slices.DeleteFunc(ifaces, func(iface os.DirEntry) bool {
+		return iface.Name() == "bonding_masters"
+	})
+
 	// Iterate over devices
-	info := make([]feature.InstanceFeature, 0, len(ifaces))
+	devIfacesinfo := make([]nfdv1alpha1.InstanceFeature, 0, len(ifaces))
+	virtualIfacesinfo := make([]nfdv1alpha1.InstanceFeature, 0, len(ifaces))
+
 	for _, iface := range ifaces {
 		name := iface.Name()
 		if _, err := os.Stat(filepath.Join(sysfsBasePath, name, "device")); err == nil {
-			info = append(info, readIfaceInfo(filepath.Join(sysfsBasePath, name)))
-		} else if klog.V(3).Enabled() {
-			klog.Infof("skipping non-device iface %q", name)
+			devIfacesinfo = append(devIfacesinfo, readIfaceInfo(filepath.Join(sysfsBasePath, name), devIfaceAttrs))
+		} else {
+			virtualIfacesinfo = append(virtualIfacesinfo, readIfaceInfo(filepath.Join(sysfsBasePath, name), virtualIfaceAttrs))
 		}
 	}
 
-	return info, nil
+	return devIfacesinfo, virtualIfacesinfo, nil
 }
 
-func readIfaceInfo(path string) feature.InstanceFeature {
+func readIfaceInfo(path string, attrFiles []string) nfdv1alpha1.InstanceFeature {
 	attrs := map[string]string{"name": filepath.Base(path)}
-	for _, attrName := range ifaceAttrs {
-		data, err := ioutil.ReadFile(filepath.Join(path, attrName))
+	for _, attrFile := range attrFiles {
+		data, err := os.ReadFile(filepath.Join(path, attrFile))
 		if err != nil {
-			if !os.IsNotExist(err) {
-				klog.Errorf("failed to read net iface attribute %s: %v", attrName, err)
+			if !os.IsNotExist(err) && !errors.Is(err, syscall.EINVAL) {
+				klog.ErrorS(err, "failed to read net iface attribute", "attributeName", attrFile)
 			}
 			continue
 		}
+		attrName := filepath.Base(attrFile)
 		attrs[attrName] = strings.TrimSpace(string(data))
 	}
 
-	for _, attrName := range devAttrs {
-		data, err := ioutil.ReadFile(filepath.Join(path, "device", attrName))
-		if err != nil {
-			if !os.IsNotExist(err) {
-				klog.Errorf("failed to read net device attribute %s: %v", attrName, err)
-			}
-			continue
-		}
-		attrs[attrName] = strings.TrimSpace(string(data))
-	}
-
-	return *feature.NewInstanceFeature(attrs)
+	return *nfdv1alpha1.NewInstanceFeature(attrs)
 
 }
 

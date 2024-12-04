@@ -4,6 +4,9 @@
   - name: host-boot
     hostPath:
       path: "/boot"
+  - name: host-proc-swaps
+    hostPath:
+      path: "/proc/swaps"
   - name: host-os-release
     hostPath:
       path: "/etc/os-release"
@@ -13,9 +16,9 @@
   - name: host-usr-lib
     hostPath:
       path: "/usr/lib"
-  - name: source-d
+  - name: host-lib
     hostPath:
-      path: "/etc/kubernetes/node-feature-discovery/source.d/"
+      path: "/lib"
   - name: features-d
     hostPath:
       path: "/etc/kubernetes/node-feature-discovery/features.d/"
@@ -35,11 +38,14 @@
   - name: host-sys
     mountPath: "/host-sys"
     readOnly: true
+  - name: host-proc-swaps
+    mountPath: "/host-proc/swaps"
+    readOnly: true
   - name: host-usr-lib
     mountPath: "/host-usr/lib"
     readOnly: true
-  - name: source-d
-    mountPath: "/etc/kubernetes/node-feature-discovery/source.d/"
+  - name: host-lib
+    mountPath: "/host-lib"
     readOnly: true
   - name: features-d
     mountPath: "/etc/kubernetes/node-feature-discovery/features.d/"

@@ -18,7 +18,6 @@ package memory
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -26,19 +25,27 @@ import (
 
 	"k8s.io/klog/v2"
 
-	"sigs.k8s.io/node-feature-discovery/pkg/api/feature"
+	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/api/nfd/v1alpha1"
 	"sigs.k8s.io/node-feature-discovery/pkg/utils"
+	"sigs.k8s.io/node-feature-discovery/pkg/utils/hostpath"
 	"sigs.k8s.io/node-feature-discovery/source"
 )
 
+// Name of this feature source
 const Name = "memory"
 
+// NvFeature is the name of the feature set that holds all discovered NVDIMM devices.
 const NvFeature = "nv"
+
+// NumaFeature is the name of the feature set that holds all NUMA related features.
 const NumaFeature = "numa"
+
+// SwapFeature is the name of the feature set that holds all Swap related features
+const SwapFeature = "swap"
 
 // memorySource implements the FeatureSource and LabelSource interfaces.
 type memorySource struct {
-	features *feature.DomainFeatures
+	features *nfdv1alpha1.Features
 }
 
 // Singleton source instance
@@ -60,8 +67,13 @@ func (s *memorySource) GetLabels() (source.FeatureLabels, error) {
 	features := s.GetFeatures()
 
 	// NUMA
-	if isNuma, ok := features.Values[NumaFeature].Elements["is_numa"]; ok && isNuma == "true" {
+	if isNuma, ok := features.Attributes[NumaFeature].Elements["is_numa"]; ok && isNuma == "true" {
 		labels["numa"] = true
+	}
+
+	// Swap
+	if isSwap, ok := features.Attributes[SwapFeature].Elements["enabled"]; ok && isSwap == "true" {
+		labels["swap"] = true
 	}
 
 	// NVDIMM
@@ -80,40 +92,61 @@ func (s *memorySource) GetLabels() (source.FeatureLabels, error) {
 
 // Discover method of the FeatureSource interface
 func (s *memorySource) Discover() error {
-	s.features = feature.NewDomainFeatures()
+	s.features = nfdv1alpha1.NewFeatures()
 
 	// Detect NUMA
 	if numa, err := detectNuma(); err != nil {
-		klog.Errorf("failed to detect NUMA nodes: %v", err)
+		klog.ErrorS(err, "failed to detect NUMA nodes")
 	} else {
-		s.features.Values[NumaFeature] = feature.ValueFeatureSet{Elements: numa}
+		s.features.Attributes[NumaFeature] = nfdv1alpha1.AttributeFeatureSet{Elements: numa}
+	}
+
+	// Detect Swap
+	if swap, err := detectSwap(); err != nil {
+		klog.ErrorS(err, "failed to detect Swap nodes")
+	} else {
+		s.features.Attributes[SwapFeature] = nfdv1alpha1.AttributeFeatureSet{Elements: swap}
 	}
 
 	// Detect NVDIMM
 	if nv, err := detectNv(); err != nil {
-		klog.Errorf("failed to detect nvdimm devices: %v", err)
+		klog.ErrorS(err, "failed to detect nvdimm devices")
 	} else {
-		s.features.Instances[NvFeature] = feature.InstanceFeatureSet{Elements: nv}
+		s.features.Instances[NvFeature] = nfdv1alpha1.InstanceFeatureSet{Elements: nv}
 	}
 
-	utils.KlogDump(3, "discovered memory features:", "  ", s.features)
+	klog.V(3).InfoS("discovered features", "featureSource", s.Name(), "features", utils.DelayedDumper(s.features))
 
 	return nil
 }
 
 // GetFeatures method of the FeatureSource Interface.
-func (s *memorySource) GetFeatures() *feature.DomainFeatures {
+func (s *memorySource) GetFeatures() *nfdv1alpha1.Features {
 	if s.features == nil {
-		s.features = feature.NewDomainFeatures()
+		s.features = nfdv1alpha1.NewFeatures()
 	}
 	return s.features
 }
 
+// detectSwap detects Swap node information
+func detectSwap() (map[string]string, error) {
+	procBasePath := hostpath.ProcDir.Path("swaps")
+	lines, err := getNumberOfNonEmptyLinesFromFile(procBasePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read swaps file: %w", err)
+	}
+	// /proc/swaps has a header row
+	// If there is more than a header then we assume we have swap.
+	return map[string]string{
+		"enabled": strconv.FormatBool(lines > 1),
+	}, nil
+}
+
 // detectNuma detects NUMA node information
 func detectNuma() (map[string]string, error) {
-	sysfsBasePath := source.SysfsDir.Path("bus/node/devices")
+	sysfsBasePath := hostpath.SysfsDir.Path("bus/node/devices")
 
-	nodes, err := ioutil.ReadDir(sysfsBasePath)
+	nodes, err := os.ReadDir(sysfsBasePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list numa nodes: %w", err)
 	}
@@ -125,13 +158,13 @@ func detectNuma() (map[string]string, error) {
 }
 
 // detectNv detects NVDIMM devices
-func detectNv() ([]feature.InstanceFeature, error) {
-	sysfsBasePath := source.SysfsDir.Path("bus/nd/devices")
-	info := make([]feature.InstanceFeature, 0)
+func detectNv() ([]nfdv1alpha1.InstanceFeature, error) {
+	sysfsBasePath := hostpath.SysfsDir.Path("bus/nd/devices")
+	info := make([]nfdv1alpha1.InstanceFeature, 0)
 
-	devices, err := ioutil.ReadDir(sysfsBasePath)
+	devices, err := os.ReadDir(sysfsBasePath)
 	if os.IsNotExist(err) {
-		klog.V(1).Info("No NVDIMM devices present")
+		klog.V(1).InfoS("No NVDIMM devices present")
 		return info, nil
 	} else if err != nil {
 		return nil, fmt.Errorf("failed to list nvdimm devices: %w", err)
@@ -149,17 +182,31 @@ func detectNv() ([]feature.InstanceFeature, error) {
 // ndDevAttrs is the list of sysfs files (under each nd device) that we're trying to read
 var ndDevAttrs = []string{"devtype", "mode"}
 
-func readNdDeviceInfo(path string) feature.InstanceFeature {
+func readNdDeviceInfo(path string) nfdv1alpha1.InstanceFeature {
 	attrs := map[string]string{"name": filepath.Base(path)}
 	for _, attrName := range ndDevAttrs {
-		data, err := ioutil.ReadFile(filepath.Join(path, attrName))
+		data, err := os.ReadFile(filepath.Join(path, attrName))
 		if err != nil {
-			klog.V(3).Infof("failed to read nd device attribute %s: %w", attrName, err)
+			klog.V(3).ErrorS(err, "failed to read nd device attribute", "attributeName", attrName)
 			continue
 		}
 		attrs[attrName] = strings.TrimSpace(string(data))
 	}
-	return *feature.NewInstanceFeature(attrs)
+	return *nfdv1alpha1.NewInstanceFeature(attrs)
+}
+
+func getNumberOfNonEmptyLinesFromFile(path string) (int, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	length := 0
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(line) != "" {
+			length++
+		}
+	}
+	return length, nil
 }
 
 func init() {

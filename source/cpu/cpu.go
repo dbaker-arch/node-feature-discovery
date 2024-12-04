@@ -17,26 +17,35 @@ limitations under the License.
 package cpu
 
 import (
-	"io/ioutil"
+	"fmt"
+	"os"
 	"strconv"
+	"strings"
 
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 
-	"sigs.k8s.io/node-feature-discovery/pkg/api/feature"
+	"github.com/klauspost/cpuid/v2"
+
+	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/api/nfd/v1alpha1"
 	"sigs.k8s.io/node-feature-discovery/pkg/utils"
+	"sigs.k8s.io/node-feature-discovery/pkg/utils/hostpath"
 	"sigs.k8s.io/node-feature-discovery/source"
 )
 
+// Name of this feature source
 const Name = "cpu"
 
 const (
-	CpuidFeature    = "cpuid"
-	CstateFeature   = "cstate"
-	PstateFeature   = "pstate"
-	RdtFeature      = "rdt"
-	SgxFeature      = "sgx"
-	SstFeature      = "sst"
-	TopologyFeature = "topology"
+	CpuidFeature       = "cpuid"
+	Cpumodel           = "model"
+	CstateFeature      = "cstate"
+	PstateFeature      = "pstate"
+	RdtFeature         = "rdt"
+	SecurityFeature    = "security"
+	SstFeature         = "sst"
+	TopologyFeature    = "topology"
+	CoprocessorFeature = "coprocessor"
 )
 
 // Configuration file options
@@ -45,6 +54,7 @@ type cpuidConfig struct {
 	AttributeWhitelist []string `json:"attributeWhitelist,omitempty"`
 }
 
+// Config holds configuration for the cpu source.
 type Config struct {
 	Cpuid cpuidConfig `json:"cpuid,omitempty"`
 }
@@ -54,6 +64,7 @@ func newDefaultConfig() *Config {
 	return &Config{
 		cpuidConfig{
 			AttributeBlacklist: []string{
+				"AVX10",
 				"BMI1",
 				"BMI2",
 				"CLMUL",
@@ -78,6 +89,7 @@ func newDefaultConfig() *Config {
 				"SSE4",
 				"SSE42",
 				"SSSE3",
+				"TDX_GUEST",
 			},
 			AttributeWhitelist: []string{},
 		},
@@ -94,7 +106,7 @@ type keyFilter struct {
 type cpuSource struct {
 	config      *Config
 	cpuidFilter *keyFilter
-	features    *feature.DomainFeatures
+	features    *nfdv1alpha1.Features
 }
 
 // Singleton source instance
@@ -120,7 +132,7 @@ func (s *cpuSource) SetConfig(conf source.Config) {
 		s.config = v
 		s.initCpuidFilter()
 	default:
-		klog.Fatalf("invalid config type: %T", conf)
+		panic(fmt.Sprintf("invalid config type: %T", conf))
 	}
 }
 
@@ -133,40 +145,57 @@ func (s *cpuSource) GetLabels() (source.FeatureLabels, error) {
 	features := s.GetFeatures()
 
 	// CPUID
-	for f := range features.Keys[CpuidFeature].Elements {
+	for f := range features.Flags[CpuidFeature].Elements {
 		if s.cpuidFilter.unmask(f) {
 			labels["cpuid."+f] = true
 		}
 	}
+	for f, v := range features.Attributes[CpuidFeature].Elements {
+		labels["cpuid."+f] = v
+	}
+
+	// CPU model
+	for k, v := range features.Attributes[Cpumodel].Elements {
+		labels["model."+k] = v
+	}
 
 	// Cstate
-	for k, v := range features.Values[CstateFeature].Elements {
+	for k, v := range features.Attributes[CstateFeature].Elements {
 		labels["cstate."+k] = v
 	}
 
 	// Pstate
-	for k, v := range features.Values[PstateFeature].Elements {
+	for k, v := range features.Attributes[PstateFeature].Elements {
 		labels["pstate."+k] = v
 	}
 
-	// RDT
-	for k := range features.Keys[RdtFeature].Elements {
-		labels["rdt."+k] = true
-	}
-
-	// SGX
-	for k, v := range features.Values[SgxFeature].Elements {
-		labels["sgx."+k] = v
+	// Security
+	// skipLabel lists features that will not have labels created but are only made available for
+	// NodeFeatureRules (e.g. to be published via extended resources instead)
+	skipLabel := sets.NewString(
+		"tdx.total_keys",
+		"sgx.epc",
+		"sev.encrypted_state_ids",
+		"sev.asids")
+	for k, v := range features.Attributes[SecurityFeature].Elements {
+		if !skipLabel.Has(k) {
+			labels["security."+k] = v
+		}
 	}
 
 	// SST
-	for k, v := range features.Values[SstFeature].Elements {
+	for k, v := range features.Attributes[SstFeature].Elements {
 		labels["power.sst_"+k] = v
 	}
 
 	// Hyperthreading
-	if v, ok := features.Values[TopologyFeature].Elements["hardware_multithreading"]; ok {
+	if v, ok := features.Attributes[TopologyFeature].Elements["hardware_multithreading"]; ok {
 		labels["hardware_multithreading"] = v
+	}
+
+	// NX
+	if v, ok := features.Attributes[CoprocessorFeature].Elements["nx_gzip"]; ok {
+		labels["coprocessor.nx_gzip"] = v
 	}
 
 	return labels, nil
@@ -174,86 +203,110 @@ func (s *cpuSource) GetLabels() (source.FeatureLabels, error) {
 
 // Discover method of the FeatureSource Interface
 func (s *cpuSource) Discover() error {
-	s.features = feature.NewDomainFeatures()
+	s.features = nfdv1alpha1.NewFeatures()
 
 	// Detect CPUID
-	s.features.Keys[CpuidFeature] = feature.NewKeyFeatures(getCpuidFlags()...)
+	s.features.Flags[CpuidFeature] = nfdv1alpha1.NewFlagFeatures(getCpuidFlags()...)
+	if cpuidAttrs := getCpuidAttributes(); cpuidAttrs != nil {
+		s.features.Attributes[CpuidFeature] = nfdv1alpha1.NewAttributeFeatures(cpuidAttrs)
+	}
+
+	// Detect CPU model
+	s.features.Attributes[Cpumodel] = nfdv1alpha1.NewAttributeFeatures(getCPUModel())
 
 	// Detect cstate configuration
 	cstate, err := detectCstate()
 	if err != nil {
-		klog.Errorf("failed to detect cstate: %v", err)
+		klog.ErrorS(err, "failed to detect cstate")
 	} else {
-		s.features.Values[CstateFeature] = feature.NewValueFeatures(cstate)
+		s.features.Attributes[CstateFeature] = nfdv1alpha1.NewAttributeFeatures(cstate)
 	}
 
 	// Detect pstate features
 	pstate, err := detectPstate()
 	if err != nil {
-		klog.Error(err)
+		klog.ErrorS(err, "failed to detect pstate")
 	}
-	s.features.Values[PstateFeature] = feature.NewValueFeatures(pstate)
+	s.features.Attributes[PstateFeature] = nfdv1alpha1.NewAttributeFeatures(pstate)
 
 	// Detect RDT features
-	s.features.Keys[RdtFeature] = feature.NewKeyFeatures(discoverRDT()...)
+	s.features.Attributes[RdtFeature] = nfdv1alpha1.NewAttributeFeatures(discoverRDT())
 
-	// Detect SGX features
-	s.features.Values[SgxFeature] = feature.NewValueFeatures(discoverSGX())
+	// Detect available guest protection(SGX,TDX,SEV) features
+	s.features.Attributes[SecurityFeature] = nfdv1alpha1.NewAttributeFeatures(discoverSecurity())
 
 	// Detect SST features
-	s.features.Values[SstFeature] = feature.NewValueFeatures(discoverSST())
+	s.features.Attributes[SstFeature] = nfdv1alpha1.NewAttributeFeatures(discoverSST())
 
 	// Detect hyper-threading
-	s.features.Values[TopologyFeature] = feature.NewValueFeatures(discoverTopology())
+	s.features.Attributes[TopologyFeature] = nfdv1alpha1.NewAttributeFeatures(discoverTopology())
 
-	utils.KlogDump(3, "discovered cpu features:", "  ", s.features)
+	// Detect Coprocessor features
+	s.features.Attributes[CoprocessorFeature] = nfdv1alpha1.NewAttributeFeatures(discoverCoprocessor())
+
+	klog.V(3).InfoS("discovered features", "featureSource", s.Name(), "features", utils.DelayedDumper(s.features))
 
 	return nil
 }
 
 // GetFeatures method of the FeatureSource Interface
-func (s *cpuSource) GetFeatures() *feature.DomainFeatures {
+func (s *cpuSource) GetFeatures() *nfdv1alpha1.Features {
 	if s.features == nil {
-		s.features = feature.NewDomainFeatures()
+		s.features = nfdv1alpha1.NewFeatures()
 	}
 	return s.features
+}
+
+func getCPUModel() map[string]string {
+	cpuModelInfo := make(map[string]string)
+	cpuModelInfo["vendor_id"] = cpuid.CPU.VendorID.String()
+	cpuModelInfo["family"] = strconv.Itoa(cpuid.CPU.Family)
+	cpuModelInfo["id"] = strconv.Itoa(cpuid.CPU.Model)
+
+	return cpuModelInfo
 }
 
 func discoverTopology() map[string]string {
 	features := make(map[string]string)
 
-	if ht, err := haveThreadSiblings(); err != nil {
-		klog.Errorf("failed to detect hyper-threading: %v", err)
-	} else {
-		features["hardware_multithreading"] = strconv.FormatBool(ht)
-	}
-
-	return features
-}
-
-// Check if any (online) CPUs have thread siblings
-func haveThreadSiblings() (bool, error) {
-
-	files, err := ioutil.ReadDir(source.SysfsDir.Path("bus/cpu/devices"))
+	files, err := os.ReadDir(hostpath.SysfsDir.Path("bus/cpu/devices"))
 	if err != nil {
-		return false, err
+		klog.ErrorS(err, "failed to read devices folder")
+		return features
 	}
+
+	ht := false
+	uniquePhysicalIDs := sets.NewString()
 
 	for _, file := range files {
 		// Try to read siblings from topology
-		siblings, err := ioutil.ReadFile(source.SysfsDir.Path("bus/cpu/devices", file.Name(), "topology/thread_siblings_list"))
+		siblings, err := os.ReadFile(hostpath.SysfsDir.Path("bus/cpu/devices", file.Name(), "topology/thread_siblings_list"))
 		if err != nil {
-			return false, err
+			klog.ErrorS(err, "error while reading thread_sigblings_list file")
+			return map[string]string{}
 		}
 		for _, char := range siblings {
 			// If list separator found, we determine that there are multiple siblings
 			if char == ',' || char == '-' {
-				return true, nil
+				ht = true
+				break
 			}
 		}
+
+		// Try to read physical_package_id from topology
+		physicalID, err := os.ReadFile(hostpath.SysfsDir.Path("bus/cpu/devices", file.Name(), "topology/physical_package_id"))
+		if err != nil {
+			klog.ErrorS(err, "error while reading physical_package_id file")
+			return map[string]string{}
+		}
+		id := strings.TrimSpace(string(physicalID))
+		uniquePhysicalIDs.Insert(id)
 	}
-	// No siblings were found
-	return false, nil
+
+	features["hardware_multithreading"] = strconv.FormatBool(ht)
+	features["socket_count"] = strconv.FormatInt(int64(uniquePhysicalIDs.Len()), 10)
+
+	return features
 }
 
 func (s *cpuSource) initCpuidFilter() {

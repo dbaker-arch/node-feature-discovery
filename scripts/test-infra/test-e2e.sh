@@ -1,25 +1,33 @@
 #!/bin/bash -e
 
-# Install deps
-curl -o $HOME/bin/aws-iam-authenticator --create-dirs https://amazon-eks.s3-us-west-2.amazonaws.com/1.10.3/2018-07-26/bin/linux/amd64/aws-iam-authenticator
-chmod a+x $HOME/bin/aws-iam-authenticator
-export PATH=$PATH:$HOME/bin
-
-
 # Configure environment
+export KIND_VERSION="v0.23.0"
+export KIND_NODE_IMAGE="kindest/node:v1.30.2"
+export CLUSTER_NAME="nfd-e2e"
 export KUBECONFIG=`pwd`/kubeconfig
-export E2E_TEST_CONFIG=`pwd`/e2e-test-config
+export IMAGE_REGISTRY="gcr.io/k8s-staging-nfd"
+export E2E_TEST_FULL_IMAGE=true
 
-echo "$KUBECONFIG_DATA" > "$KUBECONFIG"
-echo "$E2E_TEST_CONFIG_DATA" > "$E2E_TEST_CONFIG"
+# Install kind
+go install sigs.k8s.io/kind@$KIND_VERSION
 
+# create a cluster with the local registry enabled in containerd
+cat <<EOF | kind create cluster --kubeconfig $KUBECONFIG --image $KIND_NODE_IMAGE --config=-
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: $CLUSTER_NAME
+nodes:
+- role: control-plane
+- role: worker
+- role: worker
+EOF
 
 # Wait for the image to be built and published
 i=1
 while true; do
     if make poll-images; then
         break
-    elif [ $i -ge 12 ]; then
+    elif [ $i -ge 55 ]; then
         echo "ERROR: too many tries when polling for image"
         exit 1
     fi
@@ -28,7 +36,5 @@ while true; do
     i=$(( $i + 1 ))
 done
 
-
 # Configure environment and run tests
 make e2e-test
-

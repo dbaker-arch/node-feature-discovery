@@ -21,30 +21,36 @@ import (
 	"fmt"
 	"strconv"
 
-	v1 "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	client "k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 	podresourcesapi "k8s.io/kubelet/pkg/apis/podresources/v1"
 
-	"sigs.k8s.io/node-feature-discovery/pkg/apihelper"
+	"github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha2"
+	"github.com/k8stopologyawareschedwg/podfingerprint"
 )
 
 type PodResourcesScanner struct {
 	namespace         string
 	podResourceClient podresourcesapi.PodResourcesListerClient
-	apihelper         apihelper.APIHelpers
+	k8sClient         client.Interface
+	podFingerprint    bool
 }
 
-func NewPodResourcesScanner(namespace string, podResourceClient podresourcesapi.PodResourcesListerClient, kubeApihelper apihelper.APIHelpers) (ResourcesScanner, error) {
+// NewPodResourcesScanner creates a new ResourcesScanner instance
+func NewPodResourcesScanner(namespace string, podResourceClient podresourcesapi.PodResourcesListerClient, k8sClient client.Interface, podFingerprint bool) (ResourcesScanner, error) {
 	resourcemonitorInstance := &PodResourcesScanner{
 		namespace:         namespace,
 		podResourceClient: podResourceClient,
-		apihelper:         kubeApihelper,
+		k8sClient:         k8sClient,
+		podFingerprint:    podFingerprint,
 	}
 	if resourcemonitorInstance.namespace != "*" {
-		klog.Infof("watching namespace %q", resourcemonitorInstance.namespace)
+		klog.InfoS("watching one namespace", "namespace", resourcemonitorInstance.namespace)
 	} else {
-		klog.Infof("watching all namespaces")
+		klog.InfoS("watching all namespaces")
 	}
 
 	return resourcemonitorInstance, nil
@@ -52,16 +58,11 @@ func NewPodResourcesScanner(namespace string, podResourceClient podresourcesapi.
 
 // isWatchable tells if the the given namespace should be watched.
 func (resMon *PodResourcesScanner) isWatchable(podNamespace string, podName string, hasDevice bool) (bool, bool, error) {
-	cli, err := resMon.apihelper.GetClient()
-	if err != nil {
-		return false, false, err
-	}
-	pod, err := resMon.apihelper.GetPod(cli, podNamespace, podName)
+	pod, err := resMon.k8sClient.CoreV1().Pods(podNamespace).Get(context.TODO(), podName, metav1.GetOptions{})
 	if err != nil {
 		return false, false, err
 	}
 
-	klog.Infof("podresource: %s", podName)
 	isIntegralGuaranteed := hasExclusiveCPUs(pod)
 
 	if resMon.namespace == "*" && (isIntegralGuaranteed || hasDevice) {
@@ -74,13 +75,13 @@ func (resMon *PodResourcesScanner) isWatchable(podNamespace string, podName stri
 // hasExclusiveCPUs returns true if a guaranteed pod is allocated exclusive CPUs else returns false.
 // In isWatchable() function we check for the pod QoS and proceed if it is guaranteed (i.e. request == limit)
 // and hence we only check for request in the function below.
-func hasExclusiveCPUs(pod *v1.Pod) bool {
+func hasExclusiveCPUs(pod *corev1.Pod) bool {
 	var totalCPU int64
 	var cpuQuantity resource.Quantity
 	for _, container := range pod.Spec.InitContainers {
 
 		var ok bool
-		if cpuQuantity, ok = container.Resources.Requests[v1.ResourceCPU]; !ok {
+		if cpuQuantity, ok = container.Resources.Requests[corev1.ResourceCPU]; !ok {
 			continue
 		}
 		totalCPU += cpuQuantity.Value()
@@ -91,7 +92,7 @@ func hasExclusiveCPUs(pod *v1.Pod) bool {
 	}
 	for _, container := range pod.Spec.Containers {
 		var ok bool
-		if cpuQuantity, ok = container.Resources.Requests[v1.ResourceCPU]; !ok {
+		if cpuQuantity, ok = container.Resources.Requests[corev1.ResourceCPU]; !ok {
 			continue
 		}
 		totalCPU += cpuQuantity.Value()
@@ -106,30 +107,49 @@ func hasExclusiveCPUs(pod *v1.Pod) bool {
 }
 
 // hasIntegralCPUs returns true if a container in pod is requesting integral CPUs else returns false
-func hasIntegralCPUs(pod *v1.Pod, container *v1.Container) bool {
-	cpuQuantity := container.Resources.Requests[v1.ResourceCPU]
+func hasIntegralCPUs(pod *corev1.Pod, container *corev1.Container) bool {
+	cpuQuantity := container.Resources.Requests[corev1.ResourceCPU]
 	return cpuQuantity.Value()*1000 == cpuQuantity.MilliValue()
 }
 
 // Scan gathers all the PodResources from the system, using the podresources API client.
-func (resMon *PodResourcesScanner) Scan() ([]PodResources, error) {
+func (resMon *PodResourcesScanner) Scan() (ScanResponse, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultPodResourcesTimeout)
 	defer cancel()
 
 	// Pod Resource API client
 	resp, err := resMon.podResourceClient.List(ctx, &podresourcesapi.ListPodResourcesRequest{})
 	if err != nil {
-		return nil, fmt.Errorf("can't receive response: %v.Get(_) = _, %w", resMon.podResourceClient, err)
+		return ScanResponse{}, fmt.Errorf("can't receive response: %v.Get(_) = _, %w", resMon.podResourceClient, err)
 	}
 
+	respPodResources := resp.GetPodResources()
+	retVal := ScanResponse{
+		Attributes: v1alpha2.AttributeList{},
+	}
+
+	if resMon.podFingerprint && len(respPodResources) > 0 {
+		var status podfingerprint.Status
+		podFingerprintSign, err := computePodFingerprint(respPodResources, &status)
+		if err != nil {
+			klog.ErrorS(err, "failed to calculate fingerprint")
+		} else {
+			klog.InfoS("podFingerprint calculated", "status", status.Repr())
+
+			retVal.Attributes = append(retVal.Attributes, v1alpha2.AttributeInfo{
+				Name:  podfingerprint.Attribute,
+				Value: podFingerprintSign,
+			})
+		}
+	}
 	var podResData []PodResources
 
-	for _, podResource := range resp.GetPodResources() {
-		klog.Infof("podresource iter: %s", podResource.GetName())
+	for _, podResource := range respPodResources {
+		klog.InfoS("scanning pod", "podName", podResource.GetName())
 		hasDevice := hasDevice(podResource)
 		isWatchable, isIntegralGuaranteed, err := resMon.isWatchable(podResource.GetNamespace(), podResource.GetName(), hasDevice)
 		if err != nil {
-			return nil, fmt.Errorf("checking if pod in a namespace is watchable, namespace:%v, pod name %v: %v", podResource.GetNamespace(), podResource.GetName(), err)
+			return ScanResponse{}, fmt.Errorf("checking if pod in a namespace is watchable, namespace:%v, pod name %v: %w", podResource.GetNamespace(), podResource.GetName(), err)
 		}
 		if !isWatchable {
 			continue
@@ -154,7 +174,7 @@ func (resMon *PodResourcesScanner) Scan() ([]PodResources, error) {
 					}
 					contRes.Resources = []ResourceInfo{
 						{
-							Name: v1.ResourceCPU,
+							Name: corev1.ResourceCPU,
 							Data: resCPUs,
 						},
 					}
@@ -164,7 +184,7 @@ func (resMon *PodResourcesScanner) Scan() ([]PodResources, error) {
 			for _, device := range container.GetDevices() {
 				numaNodesIDs := getNumaNodeIds(device.GetTopology())
 				contRes.Resources = append(contRes.Resources, ResourceInfo{
-					Name:        v1.ResourceName(device.ResourceName),
+					Name:        corev1.ResourceName(device.ResourceName),
 					Data:        device.DeviceIds,
 					NumaNodeIds: numaNodesIDs,
 				})
@@ -177,7 +197,7 @@ func (resMon *PodResourcesScanner) Scan() ([]PodResources, error) {
 
 				topology := getNumaNodeIds(block.GetTopology())
 				contRes.Resources = append(contRes.Resources, ResourceInfo{
-					Name:        v1.ResourceName(block.MemoryType),
+					Name:        corev1.ResourceName(block.MemoryType),
 					Data:        []string{fmt.Sprintf("%d", block.GetSize_())},
 					NumaNodeIds: topology,
 				})
@@ -197,7 +217,9 @@ func (resMon *PodResourcesScanner) Scan() ([]PodResources, error) {
 
 	}
 
-	return podResData, nil
+	retVal.PodResources = podResData
+
+	return retVal, nil
 }
 
 func hasDevice(podResource *podresourcesapi.PodResources) bool {
@@ -206,7 +228,7 @@ func hasDevice(podResource *podresourcesapi.PodResources) bool {
 			return true
 		}
 	}
-	klog.Infof("pod:%s doesn't have devices", podResource.GetName())
+	klog.InfoS("pod doesn't have devices", "podName", podResource.GetName())
 	return false
 }
 
@@ -223,4 +245,15 @@ func getNumaNodeIds(topologyInfo *podresourcesapi.TopologyInfo) []int {
 	}
 
 	return topology
+}
+
+func computePodFingerprint(podResources []*podresourcesapi.PodResources, status *podfingerprint.Status) (string, error) {
+	fingerprint := podfingerprint.NewTracingFingerprint(len(podResources), status)
+	for _, podResource := range podResources {
+		err := fingerprint.Add(podResource.Namespace, podResource.Name)
+		if err != nil {
+			return "", err
+		}
+	}
+	return fingerprint.Sign(), nil
 }

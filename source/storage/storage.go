@@ -18,24 +18,26 @@ package storage
 
 import (
 	"fmt"
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"strings"
 
 	"k8s.io/klog/v2"
 
-	"sigs.k8s.io/node-feature-discovery/pkg/api/feature"
+	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/api/nfd/v1alpha1"
 	"sigs.k8s.io/node-feature-discovery/pkg/utils"
+	"sigs.k8s.io/node-feature-discovery/pkg/utils/hostpath"
 	"sigs.k8s.io/node-feature-discovery/source"
 )
 
+// Name of this feature source
 const Name = "storage"
 
 const BlockFeature = "block"
 
 // storageSource implements the FeatureSource and LabelSource interfaces.
 type storageSource struct {
-	features *feature.DomainFeatures
+	features *nfdv1alpha1.Features
 }
 
 // Singleton source instance
@@ -71,37 +73,37 @@ func (s *storageSource) GetLabels() (source.FeatureLabels, error) {
 
 // Discover method of the FeatureSource interface
 func (s *storageSource) Discover() error {
-	s.features = feature.NewDomainFeatures()
+	s.features = nfdv1alpha1.NewFeatures()
 
 	devs, err := detectBlock()
 	if err != nil {
 		return fmt.Errorf("failed to detect block devices: %w", err)
 	}
-	s.features.Instances[BlockFeature] = feature.InstanceFeatureSet{Elements: devs}
+	s.features.Instances[BlockFeature] = nfdv1alpha1.InstanceFeatureSet{Elements: devs}
 
-	utils.KlogDump(3, "discovered storage features:", "  ", s.features)
+	klog.V(3).InfoS("discovered features", "featureSource", s.Name(), "features", utils.DelayedDumper(s.features))
 
 	return nil
 }
 
 // GetFeatures method of the FeatureSource Interface.
-func (s *storageSource) GetFeatures() *feature.DomainFeatures {
+func (s *storageSource) GetFeatures() *nfdv1alpha1.Features {
 	if s.features == nil {
-		s.features = feature.NewDomainFeatures()
+		s.features = nfdv1alpha1.NewFeatures()
 	}
 	return s.features
 }
 
-func detectBlock() ([]feature.InstanceFeature, error) {
-	sysfsBasePath := source.SysfsDir.Path("block")
+func detectBlock() ([]nfdv1alpha1.InstanceFeature, error) {
+	sysfsBasePath := hostpath.SysfsDir.Path("block")
 
-	blockdevices, err := ioutil.ReadDir(sysfsBasePath)
+	blockdevices, err := os.ReadDir(sysfsBasePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list block devices: %w", err)
 	}
 
 	// Iterate over devices
-	info := make([]feature.InstanceFeature, 0, len(blockdevices))
+	info := make([]nfdv1alpha1.InstanceFeature, 0, len(blockdevices))
 	for _, device := range blockdevices {
 		info = append(info, *readBlockDevQueueInfo(filepath.Join(sysfsBasePath, device.Name())))
 	}
@@ -109,17 +111,17 @@ func detectBlock() ([]feature.InstanceFeature, error) {
 	return info, nil
 }
 
-func readBlockDevQueueInfo(path string) *feature.InstanceFeature {
+func readBlockDevQueueInfo(path string) *nfdv1alpha1.InstanceFeature {
 	attrs := map[string]string{"name": filepath.Base(path)}
 	for _, attrName := range queueAttrs {
-		data, err := ioutil.ReadFile(filepath.Join(path, "queue", attrName))
+		data, err := os.ReadFile(filepath.Join(path, "queue", attrName))
 		if err != nil {
-			klog.V(3).Infof("failed to read block device queue attribute %s: %w", attrName, err)
+			klog.V(3).ErrorS(err, "failed to read block device queue attribute", "attributeName", attrName)
 			continue
 		}
 		attrs[attrName] = strings.TrimSpace(string(data))
 	}
-	return feature.NewInstanceFeature(attrs)
+	return nfdv1alpha1.NewInstanceFeature(attrs)
 }
 
 func init() {

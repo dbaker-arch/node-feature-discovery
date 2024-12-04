@@ -16,12 +16,12 @@ limitations under the License.
 
 package source
 
-//go:generate mockery --name=LabelSource --inpkg
+//go:generate mockery --name=LabelSource --inpackage
 
 import (
 	"fmt"
 
-	"sigs.k8s.io/node-feature-discovery/pkg/api/feature"
+	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/api/nfd/v1alpha1"
 )
 
 // Source is the base interface for all other source interfaces
@@ -38,7 +38,7 @@ type FeatureSource interface {
 	Discover() error
 
 	// GetFeatures returns discovered features in raw form
-	GetFeatures() *feature.DomainFeatures
+	GetFeatures() *nfdv1alpha1.Features
 }
 
 // LabelSource represents a source of node feature labels
@@ -90,7 +90,7 @@ type Config interface {
 // sources contain all registered sources
 var sources = make(map[string]Source)
 
-// RegisterSource registers a source
+// Register registers a source.
 func Register(s Source) {
 	if name, ok := sources[s.Name()]; ok {
 		panic(fmt.Sprintf("source %q already registered", name))
@@ -153,4 +153,29 @@ func GetAllConfigurableSources() map[string]ConfigurableSource {
 		}
 	}
 	return all
+}
+
+// GetAllFeatures returns a combined set of all features from all feature
+// sources.
+func GetAllFeatures() *nfdv1alpha1.Features {
+	features := nfdv1alpha1.NewFeatures()
+	for n, s := range GetAllFeatureSources() {
+		f := s.GetFeatures()
+		for k, v := range f.Flags {
+			// Prefix feature with the name of the source
+			k = n + "." + k
+			features.Flags[k] = v
+		}
+		for k, v := range f.Attributes {
+			// Prefix feature with the name of the source
+			k = n + "." + k
+			features.Attributes[k] = v
+		}
+		for k, v := range f.Instances {
+			// Prefix feature with the name of the source
+			k = n + "." + k
+			features.Instances[k] = v
+		}
+	}
+	return features
 }

@@ -18,7 +18,6 @@ package cpu
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"strconv"
 	"strings"
@@ -26,11 +25,11 @@ import (
 	"k8s.io/klog/v2"
 
 	"sigs.k8s.io/node-feature-discovery/pkg/cpuid"
-	"sigs.k8s.io/node-feature-discovery/source"
+	"sigs.k8s.io/node-feature-discovery/pkg/utils/hostpath"
 )
 
 const (
-	// CPUID EAX input values
+	// LEAF_PROCESSOR_FREQUENCY_INFORMATION is the cpuid leaf to get processor frequency information
 	LEAF_PROCESSOR_FREQUENCY_INFORMATION = 0x16
 )
 
@@ -38,7 +37,7 @@ func discoverSST() map[string]string {
 	features := make(map[string]string)
 
 	if bf, err := discoverSSTBF(); err != nil {
-		klog.Errorf("failed to detect SST-BF: %v", err)
+		klog.ErrorS(err, "failed to detect SST-BF")
 	} else if bf {
 		features["bf.enabled"] = strconv.FormatBool(bf)
 	}
@@ -52,15 +51,15 @@ func discoverSSTBF() (bool, error) {
 	nominalBaseFrequency := int(freqInfo.EAX)
 
 	// Loop over all CPUs in the system
-	files, err := ioutil.ReadDir(source.SysfsDir.Path("bus/cpu/devices"))
+	files, err := os.ReadDir(hostpath.SysfsDir.Path("bus/cpu/devices"))
 
 	if err != nil {
 		return false, err
 	}
 	for _, file := range files {
 		// Try to read effective base frequency of each cpu in the system
-		filePath := source.SysfsDir.Path("bus/cpu/devices", file.Name(), "cpufreq/base_frequency")
-		data, err := ioutil.ReadFile(filePath)
+		filePath := hostpath.SysfsDir.Path("bus/cpu/devices", file.Name(), "cpufreq/base_frequency")
+		data, err := os.ReadFile(filePath)
 		if os.IsNotExist(err) {
 			// Ignore missing file and continue to check other CPUs
 			continue
@@ -70,7 +69,7 @@ func discoverSSTBF() (bool, error) {
 
 		effectiveBaseFreq, err := strconv.Atoi(strings.TrimSpace(string(data)))
 		if err != nil {
-			return false, fmt.Errorf("non-integer value of %q: %v", filePath, err)
+			return false, fmt.Errorf("non-integer value of %q: %w", filePath, err)
 		}
 
 		// Sanity check: Return an error (we don't have enough information to

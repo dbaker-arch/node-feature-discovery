@@ -23,6 +23,9 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
+
+	"golang.org/x/exp/maps"
 )
 
 // RegexpVal is a wrapper for regexp command line flags
@@ -37,25 +40,6 @@ func (a *RegexpVal) Set(val string) error {
 		a.Regexp = *r
 	}
 	return err
-}
-
-// UnmarshalJSON implements the Unmarshaler interface from "encoding/json"
-func (a *RegexpVal) UnmarshalJSON(data []byte) error {
-	var v interface{}
-	if err := json.Unmarshal(data, &v); err != nil {
-		return err
-	}
-	switch val := v.(type) {
-	case string:
-		if r, err := regexp.Compile(string(val)); err != nil {
-			return err
-		} else {
-			*a = RegexpVal{*r}
-		}
-	default:
-		return fmt.Errorf("invalid regexp %s", data)
-	}
-	return nil
 }
 
 // StringSetVal is a Value encapsulating a set of comma-separated strings
@@ -76,13 +60,21 @@ func (a *StringSetVal) String() string {
 	if *a == nil {
 		return ""
 	}
-
-	vals := make([]string, len(*a), 0)
-	for val := range *a {
-		vals = append(vals, val)
-	}
+	vals := maps.Keys(*a)
 	sort.Strings(vals)
 	return strings.Join(vals, ",")
+}
+
+// UnmarshalJSON implements the Unmarshaler interface from "encoding/json"
+func (a *StringSetVal) UnmarshalJSON(data []byte) error {
+	var tmp []string
+	if err := json.Unmarshal(data, &tmp); err != nil {
+		return err
+	}
+	for _, v := range tmp {
+		(*a)[v] = struct{}{}
+	}
+	return nil
 }
 
 // StringSliceVal is a Value encapsulating a slice of comma-separated strings
@@ -161,4 +153,40 @@ func NewKlogFlagVal(f *flag.Flag) *KlogFlagVal {
 // boolFlag replicates boolFlag interface internal to the flag package
 type boolFlag interface {
 	IsBoolFlag() bool
+}
+
+// DurationVal is a wrapper for handling time.Duration as a command line flag
+type DurationVal struct {
+	time.Duration
+}
+
+// UnmarshalJSON implements the Unmarshaler interface from "encoding/json"
+func (d *DurationVal) UnmarshalJSON(data []byte) error {
+	var v interface{}
+	if err := json.Unmarshal(data, &v); err != nil {
+		return err
+	}
+	switch val := v.(type) {
+	case float64:
+		d.Duration = time.Duration(val)
+	case string:
+		var err error
+		d.Duration, err = time.ParseDuration(val)
+		if err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("invalid duration %s", data)
+	}
+	return nil
+}
+
+// Set implements the flag.Value interface
+func (d *DurationVal) Set(val string) error {
+	m, err := time.ParseDuration(val)
+	if err != nil {
+		return err
+	}
+	*d = DurationVal{m}
+	return nil
 }

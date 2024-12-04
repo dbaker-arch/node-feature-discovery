@@ -17,22 +17,25 @@ limitations under the License.
 package kernel
 
 import (
+	"fmt"
 	"strconv"
 
 	"k8s.io/klog/v2"
 
-	"sigs.k8s.io/node-feature-discovery/pkg/api/feature"
+	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/api/nfd/v1alpha1"
 	"sigs.k8s.io/node-feature-discovery/pkg/utils"
 	"sigs.k8s.io/node-feature-discovery/source"
 )
 
+// Name of this feature source
 const Name = "kernel"
 
 const (
-	ConfigFeature       = "config"
-	LoadedModuleFeature = "loadedmodule"
-	SelinuxFeature      = "selinux"
-	VersionFeature      = "version"
+	ConfigFeature        = "config"
+	LoadedModuleFeature  = "loadedmodule"
+	SelinuxFeature       = "selinux"
+	VersionFeature       = "version"
+	EnabledModuleFeature = "enabledmodule"
 )
 
 // Configuration file options
@@ -57,7 +60,7 @@ func newDefaultConfig() *Config {
 // kernelSource implements the FeatureSource, LabelSource and ConfigurableSource interfaces.
 type kernelSource struct {
 	config   *Config
-	features *feature.DomainFeatures
+	features *nfdv1alpha1.Features
 	// legacyKconfig contains mangled kconfig values used for
 	// kernel.config-<flag> labels and legacy kConfig custom rules.
 	legacyKconfig map[string]string
@@ -85,7 +88,7 @@ func (s *kernelSource) SetConfig(conf source.Config) {
 	case *Config:
 		s.config = v
 	default:
-		klog.Fatalf("invalid config type: %T", conf)
+		panic(fmt.Sprintf("invalid config type: %T", conf))
 	}
 }
 
@@ -97,7 +100,7 @@ func (s *kernelSource) GetLabels() (source.FeatureLabels, error) {
 	labels := source.FeatureLabels{}
 	features := s.GetFeatures()
 
-	for k, v := range features.Values[VersionFeature].Elements {
+	for k, v := range features.Attributes[VersionFeature].Elements {
 		labels[VersionFeature+"."+k] = v
 	}
 
@@ -107,7 +110,7 @@ func (s *kernelSource) GetLabels() (source.FeatureLabels, error) {
 		}
 	}
 
-	if enabled, ok := features.Values[SelinuxFeature].Elements["enabled"]; ok && enabled == "true" {
+	if enabled, ok := features.Attributes[SelinuxFeature].Elements["enabled"]; ok && enabled == "true" {
 		labels["selinux.enabled"] = "true"
 	}
 
@@ -116,45 +119,54 @@ func (s *kernelSource) GetLabels() (source.FeatureLabels, error) {
 
 // Discover method of the FeatureSource interface
 func (s *kernelSource) Discover() error {
-	s.features = feature.NewDomainFeatures()
+	s.features = nfdv1alpha1.NewFeatures()
 
 	// Read kernel version
-	if version, err := parseVersion(); err != nil {
-		klog.Errorf("failed to get kernel version: %s", err)
+	if version, err := discoverVersion(); err != nil {
+		klog.ErrorS(err, "failed to get kernel version")
 	} else {
-		s.features.Values[VersionFeature] = feature.NewValueFeatures(version)
+		s.features.Attributes[VersionFeature] = nfdv1alpha1.NewAttributeFeatures(version)
 	}
 
 	// Read kconfig
 	if realKconfig, legacyKconfig, err := parseKconfig(s.config.KconfigFile); err != nil {
 		s.legacyKconfig = nil
-		klog.Errorf("failed to read kconfig: %s", err)
+		klog.ErrorS(err, "failed to read kconfig")
 	} else {
-		s.features.Values[ConfigFeature] = feature.NewValueFeatures(realKconfig)
+		s.features.Attributes[ConfigFeature] = nfdv1alpha1.NewAttributeFeatures(realKconfig)
 		s.legacyKconfig = legacyKconfig
 	}
 
+	var enabledModules []string
 	if kmods, err := getLoadedModules(); err != nil {
-		klog.Errorf("failed to get loaded kernel modules: %v", err)
+		klog.ErrorS(err, "failed to get loaded kernel modules")
 	} else {
-		s.features.Keys[LoadedModuleFeature] = feature.NewKeyFeatures(kmods...)
+		enabledModules = append(enabledModules, kmods...)
+		s.features.Flags[LoadedModuleFeature] = nfdv1alpha1.NewFlagFeatures(kmods...)
+	}
+
+	if builtinMods, err := getBuiltinModules(); err != nil {
+		klog.ErrorS(err, "failed to get builtin kernel modules")
+	} else {
+		enabledModules = append(enabledModules, builtinMods...)
+		s.features.Flags[EnabledModuleFeature] = nfdv1alpha1.NewFlagFeatures(enabledModules...)
 	}
 
 	if selinux, err := SelinuxEnabled(); err != nil {
-		klog.Warning(err)
+		klog.ErrorS(err, "failed to detect selinux status")
 	} else {
-		s.features.Values[SelinuxFeature] = feature.NewValueFeatures(nil)
-		s.features.Values[SelinuxFeature].Elements["enabled"] = strconv.FormatBool(selinux)
+		s.features.Attributes[SelinuxFeature] = nfdv1alpha1.NewAttributeFeatures(nil)
+		s.features.Attributes[SelinuxFeature].Elements["enabled"] = strconv.FormatBool(selinux)
 	}
 
-	utils.KlogDump(3, "discovered kernel features:", "  ", s.features)
+	klog.V(3).InfoS("discovered features", "featureSource", s.Name(), "features", utils.DelayedDumper(s.features))
 
 	return nil
 }
 
-func (s *kernelSource) GetFeatures() *feature.DomainFeatures {
+func (s *kernelSource) GetFeatures() *nfdv1alpha1.Features {
 	if s.features == nil {
-		s.features = feature.NewDomainFeatures()
+		s.features = nfdv1alpha1.NewFeatures()
 	}
 	return s.features
 }

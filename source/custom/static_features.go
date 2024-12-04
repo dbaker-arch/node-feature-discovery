@@ -17,46 +17,44 @@ limitations under the License.
 package custom
 
 import (
-	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/pkg/apis/nfd/v1alpha1"
-	"sigs.k8s.io/node-feature-discovery/source/custom/rules"
+	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/api/nfd/v1alpha1"
 )
 
-// getStaticFeatures returns statically configured custom features to discover
+// getStaticRules returns statically configured custom features to discover
 // e.g RMDA related features. NFD configuration file may extend these custom features by adding rules.
-func getStaticFeatureConfig() []CustomRule {
-	return []CustomRule{
+func getStaticRules() []nfdv1alpha1.Rule {
+	return []nfdv1alpha1.Rule{
 		{
-			LegacyRule: &LegacyRule{
-				Name: "rdma.capable",
-				MatchOn: []LegacyMatcher{
-					{
-						PciID: &rules.PciIDRule{
-							MatchExpressionSet: nfdv1alpha1.MatchExpressionSet{
-								Expressions: nfdv1alpha1.Expressions{
-									"vendor": nfdv1alpha1.MustCreateMatchExpression(nfdv1alpha1.MatchIn, "15b3"),
-								},
-							},
-						},
+			Name:   "RDMA capable static rule",
+			Labels: map[string]string{"rdma.capable": "true"},
+			MatchFeatures: nfdv1alpha1.FeatureMatcher{
+				nfdv1alpha1.FeatureMatcherTerm{
+					Feature: "pci.device",
+					MatchExpressions: &nfdv1alpha1.MatchExpressionSet{
+						"vendor": &nfdv1alpha1.MatchExpression{
+							Op:    nfdv1alpha1.MatchIn,
+							Value: nfdv1alpha1.MatchValue{"15b3"}},
 					},
 				},
 			},
 		},
 		{
-			LegacyRule: &LegacyRule{
-				Name: "rdma.available",
-				MatchOn: []LegacyMatcher{
-					{
-						LoadedKMod: &rules.LoadedKModRule{
-							MatchExpressionSet: nfdv1alpha1.MatchExpressionSet{
-								Expressions: nfdv1alpha1.Expressions{
-									"ib_uverbs": nfdv1alpha1.MustCreateMatchExpression(nfdv1alpha1.MatchExists),
-									"rdma_ucm":  nfdv1alpha1.MustCreateMatchExpression(nfdv1alpha1.MatchExists),
-								},
-							},
+			Name:   "RDMA available static rule",
+			Labels: map[string]string{"rdma.available": "true"},
+			MatchFeatures: nfdv1alpha1.FeatureMatcher{
+				nfdv1alpha1.FeatureMatcherTerm{
+					Feature: "kernel.loadedmodule",
+					MatchExpressions: &nfdv1alpha1.MatchExpressionSet{
+						"ib_uverbs": &nfdv1alpha1.MatchExpression{
+							Op: nfdv1alpha1.MatchExists,
+						},
+						"rdma_ucm": &nfdv1alpha1.MatchExpression{
+							Op: nfdv1alpha1.MatchExists,
 						},
 					},
 				},
 			},
 		},
 	}
+
 }

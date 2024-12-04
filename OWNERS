@@ -3,10 +3,15 @@
 #
 
 approvers:
+  - ArangoGutierrez
   - marquiz
 reviewers:
-  - ArangoGutierrez
-  - Ethyling
-  - kad
-  - zvonkok
   - adrianchiris
+  - ArangoGutierrez
+  - fmuyassarov
+  - jjacobelli
+  - kad
+  - marquiz
+  - PiotrProkop
+  - TessaIO
+  - zvonkok

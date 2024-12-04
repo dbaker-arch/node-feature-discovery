@@ -17,36 +17,37 @@ limitations under the License.
 package custom
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"k8s.io/klog/v2"
+	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/api/nfd/v1alpha1"
+	api "sigs.k8s.io/node-feature-discovery/source/custom/api"
 	"sigs.k8s.io/yaml"
 )
 
 // Directory stores the full path for the custom sources folder
 const Directory = "/etc/kubernetes/node-feature-discovery/custom.d"
 
-// getDirectoryFeatureConfig returns features configured in the "/etc/kubernetes/node-feature-discovery/custom.d"
+// getDropinDirRules returns features configured in the "/etc/kubernetes/node-feature-discovery/custom.d"
 // host directory and its 1st level subdirectories, which can be populated e.g. by ConfigMaps
-func getDirectoryFeatureConfig() []CustomRule {
+func getDropinDirRules() []nfdv1alpha1.Rule {
 	features := readDir(Directory, true)
-	klog.V(1).Infof("all configmap based custom feature specs: %+v", features)
+	klog.V(3).InfoS("all custom feature specs from config dir", "featureSpecs", features)
 	return features
 }
 
-func readDir(dirName string, recursive bool) []CustomRule {
-	features := make([]CustomRule, 0)
+func readDir(dirName string, recursive bool) []nfdv1alpha1.Rule {
+	features := make([]nfdv1alpha1.Rule, 0)
 
-	klog.V(1).Infof("getting files in %s", dirName)
-	files, err := ioutil.ReadDir(dirName)
+	klog.V(4).InfoS("reading directory", "path", dirName)
+	files, err := os.ReadDir(dirName)
 	if err != nil {
 		if os.IsNotExist(err) {
-			klog.V(1).Infof("custom config directory %q does not exist", dirName)
+			klog.V(4).InfoS("directory does not exist", "path", dirName)
 		} else {
-			klog.Errorf("unable to access custom config directory %q, %v", dirName, err)
+			klog.ErrorS(err, "unable to access directory", "path", dirName)
 		}
 		return features
 	}
@@ -56,34 +57,33 @@ func readDir(dirName string, recursive bool) []CustomRule {
 
 		if file.IsDir() {
 			if recursive {
-				klog.V(1).Infof("processing dir %q", fileName)
+				klog.V(4).InfoS("processing directory", "path", fileName)
 				features = append(features, readDir(fileName, false)...)
 			} else {
-				klog.V(2).Infof("skipping dir %q", fileName)
+				klog.V(4).InfoS("skipping directory", "path", fileName)
 			}
 			continue
 		}
 		if strings.HasPrefix(file.Name(), ".") {
-			klog.V(2).Infof("skipping hidden file %q", fileName)
+			klog.V(4).InfoS("skipping hidden file", "path", fileName)
 			continue
 		}
-		klog.V(2).Infof("processing file %q", fileName)
+		klog.V(4).InfoS("processing file", "path", fileName)
 
-		bytes, err := ioutil.ReadFile(fileName)
+		bytes, err := os.ReadFile(fileName)
 		if err != nil {
-			klog.Errorf("could not read custom config file %q, %v", fileName, err)
+			klog.ErrorS(err, "could not read file", "path", fileName)
 			continue
 		}
-		klog.V(2).Infof("custom config rules raw: %s", string(bytes))
 
-		config := &[]CustomRule{}
+		config := &[]api.Rule{}
 		err = yaml.UnmarshalStrict(bytes, config)
 		if err != nil {
-			klog.Errorf("could not parse custom config file %q, %v", fileName, err)
+			klog.ErrorS(err, "could not parse file", "path", fileName)
 			continue
 		}
 
-		features = append(features, *config...)
+		features = append(features, convertInternalRulesToNfdApi(config)...)
 	}
 	return features
 }

@@ -17,151 +17,203 @@ limitations under the License.
 package nfdmaster
 
 import (
-	"path"
-	"regexp"
+	"errors"
+	"fmt"
+	"maps"
+	"os"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/smartystreets/assertions"
 	. "github.com/smartystreets/goconvey/convey"
-	"github.com/stretchr/testify/mock"
-	"github.com/vektra/errors"
 	"golang.org/x/net/context"
-	api "k8s.io/api/core/v1"
+
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	k8sclient "k8s.io/client-go/kubernetes"
-	"sigs.k8s.io/node-feature-discovery/pkg/apihelper"
-	"sigs.k8s.io/node-feature-discovery/pkg/labeler"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
+	fakeclient "k8s.io/client-go/kubernetes/fake"
+	fakecorev1client "k8s.io/client-go/kubernetes/typed/core/v1/fake"
+	clienttesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/cache"
+
+	nfdclientset "sigs.k8s.io/node-feature-discovery/api/generated/clientset/versioned"
+	fakenfdclient "sigs.k8s.io/node-feature-discovery/api/generated/clientset/versioned/fake"
+	nfdscheme "sigs.k8s.io/node-feature-discovery/api/generated/clientset/versioned/scheme"
+	nfdinformers "sigs.k8s.io/node-feature-discovery/api/generated/informers/externalversions"
+	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/api/nfd/v1alpha1"
+	"sigs.k8s.io/node-feature-discovery/pkg/features"
 	"sigs.k8s.io/node-feature-discovery/pkg/utils"
-	"sigs.k8s.io/node-feature-discovery/pkg/version"
-	"sigs.k8s.io/yaml"
 )
 
 const (
-	mockNodeName = "mock-node"
+	testNodeName = "mock-node"
 )
 
-func newMockNode() *api.Node {
-	n := api.Node{}
-	n.Name = mockNodeName
+func newTestNode() *corev1.Node {
+	n := corev1.Node{}
+	n.Name = testNodeName
 	n.Labels = map[string]string{}
 	n.Annotations = map[string]string{}
-	n.Status.Capacity = api.ResourceList{}
+	n.Status.Capacity = corev1.ResourceList{"cpu": resource.MustParse("2")}
 	return &n
 }
 
-func newMockMaster(apihelper apihelper.APIHelpers) *nfdMaster {
-	return &nfdMaster{
-		nodeName:     mockNodeName,
-		annotationNs: AnnotationNsBase,
-		args:         Args{LabelWhiteList: utils.RegexpVal{Regexp: *regexp.MustCompile("")}},
-		apihelper:    apihelper,
+func newFakeNfdAPIController(client *fakenfdclient.Clientset) *nfdController {
+	c := &nfdController{
+		stopChan:           make(chan struct{}),
+		updateAllNodesChan: make(chan struct{}, 1),
+		updateOneNodeChan:  make(chan string),
 	}
+
+	informerFactory := nfdinformers.NewSharedInformerFactory(client, 1*time.Hour)
+
+	// Add informer for NodeFeature objects
+	featureInformer := informerFactory.Nfd().V1alpha1().NodeFeatures()
+	if _, err := featureInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(obj interface{}) {},
+		UpdateFunc: func(oldObj, newObj interface{}) {},
+		DeleteFunc: func(obj interface{}) {},
+	}); err != nil {
+		return nil
+	}
+	c.featureLister = featureInformer.Lister()
+
+	// Add informer for NodeFeatureRule objects
+	ruleInformer := informerFactory.Nfd().V1alpha1().NodeFeatureRules()
+	if _, err := ruleInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(object interface{}) {},
+		UpdateFunc: func(oldObject, newObject interface{}) {},
+		DeleteFunc: func(object interface{}) {},
+	}); err != nil {
+		return nil
+	}
+	c.ruleLister = ruleInformer.Lister()
+
+	// Start informers
+	informerFactory.Start(c.stopChan)
+
+	utilruntime.Must(nfdv1alpha1.AddToScheme(nfdscheme.Scheme))
+
+	return c
 }
 
-func TestUpdateNodeFeatures(t *testing.T) {
+func withNodeName(nodeName string) NfdMasterOption {
+	return &nfdMasterOpt{f: func(n *nfdMaster) { n.nodeName = nodeName }}
+}
+
+func withConfig(config *NFDConfig) NfdMasterOption {
+	return &nfdMasterOpt{f: func(n *nfdMaster) { n.config = config }}
+}
+
+// withNFDClient forces to use the given client for the NFD API, without
+// initializing one from kubeconfig.
+func withNFDClient(cli nfdclientset.Interface) NfdMasterOption {
+	return &nfdMasterOpt{f: func(n *nfdMaster) { n.nfdClient = cli }}
+}
+
+func newFakeMaster(opts ...NfdMasterOption) *nfdMaster {
+	nfdCli := fakenfdclient.NewSimpleClientset()
+	defaultOpts := []NfdMasterOption{
+		withNodeName(testNodeName),
+		withConfig(&NFDConfig{Restrictions: Restrictions{AllowOverwrite: true}}),
+		WithKubernetesClient(fakeclient.NewSimpleClientset()),
+		withNFDClient(nfdCli),
+	}
+	m, err := NewNfdMaster(append(defaultOpts, opts...)...)
+	if err != nil {
+		panic(err)
+	}
+	// Add FeatureGates
+	if err := features.NFDMutableFeatureGate.Add(features.DefaultNFDFeatureGates); err != nil {
+		panic(err)
+	}
+	return m.(*nfdMaster)
+}
+
+func TestUpdateNodeObject(t *testing.T) {
 	Convey("When I update the node using fake client", t, func() {
-		fakeFeatureLabels := map[string]string{
-			FeatureLabelNs + "/source-feature.1": "1",
-			FeatureLabelNs + "/source-feature.2": "2",
-			FeatureLabelNs + "/source-feature.3": "val3",
-			ProfileLabelNs + "/profile-a":        "val4"}
-		fakeAnnotations := map[string]string{"my-annotation": "my-val"}
-		fakeExtResources := ExtendedResources{FeatureLabelNs + "/source-feature.1": "1", FeatureLabelNs + "/source-feature.2": "2"}
-
-		fakeFeatureLabelNames := make([]string, 0, len(fakeFeatureLabels))
-		for k := range fakeFeatureLabels {
-			fakeFeatureLabelNames = append(fakeFeatureLabelNames, strings.TrimPrefix(k, FeatureLabelNs+"/"))
+		featureLabels := map[string]string{
+			nfdv1alpha1.FeatureLabelNs + "/source-feature.1": "1",
+			nfdv1alpha1.FeatureLabelNs + "/source-feature.2": "2",
+			nfdv1alpha1.FeatureLabelNs + "/source-feature.3": "val3",
+			nfdv1alpha1.ProfileLabelNs + "/profile-a":        "val4",
 		}
-		sort.Strings(fakeFeatureLabelNames)
-
-		fakeExtResourceNames := make([]string, 0, len(fakeExtResources))
-		for k := range fakeExtResources {
-			fakeExtResourceNames = append(fakeExtResourceNames, strings.TrimPrefix(k, FeatureLabelNs+"/"))
+		featureAnnotations := map[string]string{
+			"feature.node.kubernetesl.io/my-annotation": "my-val",
 		}
-		sort.Strings(fakeExtResourceNames)
+		featureExtResources := map[string]string{
+			nfdv1alpha1.FeatureLabelNs + "/source-feature.1": "1",
+			nfdv1alpha1.FeatureLabelNs + "/source-feature.2": "2",
+		}
 
-		mockAPIHelper := new(apihelper.MockAPIHelpers)
-		mockMaster := newMockMaster(mockAPIHelper)
-		mockClient := &k8sclient.Clientset{}
-		// Mock node with old features
-		mockNode := newMockNode()
-		mockNode.Labels[FeatureLabelNs+"/old-feature"] = "old-value"
-		mockNode.Annotations[AnnotationNsBase+"/feature-labels"] = "old-feature"
+		featureLabelNames := make([]string, 0, len(featureLabels))
+		for k := range featureLabels {
+			featureLabelNames = append(featureLabelNames, strings.TrimPrefix(k, nfdv1alpha1.FeatureLabelNs+"/"))
+		}
+		sort.Strings(featureLabelNames)
+
+		featureAnnotationNames := make([]string, 0, len(featureLabels))
+		for k := range featureAnnotations {
+			featureAnnotationNames = append(featureAnnotationNames, strings.TrimPrefix(k, nfdv1alpha1.FeatureAnnotationNs+"/"))
+		}
+		sort.Strings(featureAnnotationNames)
+
+		featureExtResourceNames := make([]string, 0, len(featureExtResources))
+		for k := range featureExtResources {
+			featureExtResourceNames = append(featureExtResourceNames, strings.TrimPrefix(k, nfdv1alpha1.FeatureLabelNs+"/"))
+		}
+		sort.Strings(featureExtResourceNames)
+
+		// Create a node with some existing features
+		testNode := newTestNode()
+		testNode.Labels[nfdv1alpha1.FeatureLabelNs+"/old-feature"] = "old-value"
+		testNode.Annotations[nfdv1alpha1.AnnotationNs+"/feature-labels"] = "old-feature"
+
+		// Create fake api client and initialize NfdMaster instance
+		fakeCli := fakeclient.NewSimpleClientset(testNode)
+		fakeMaster := newFakeMaster(WithKubernetesClient(fakeCli))
 
 		Convey("When I successfully update the node with feature labels", func() {
-			// Create a list of expected node metadata patches
-			metadataPatches := []apihelper.JsonPatch{
-				apihelper.NewJsonPatch("replace", "/metadata/annotations", AnnotationNsBase+"/feature-labels", strings.Join(fakeFeatureLabelNames, ",")),
-				apihelper.NewJsonPatch("add", "/metadata/annotations", AnnotationNsBase+"/extended-resources", strings.Join(fakeExtResourceNames, ",")),
-				apihelper.NewJsonPatch("remove", "/metadata/labels", FeatureLabelNs+"/old-feature", ""),
-			}
-			for k, v := range fakeFeatureLabels {
-				metadataPatches = append(metadataPatches, apihelper.NewJsonPatch("add", "/metadata/labels", k, v))
-			}
-			for k, v := range fakeAnnotations {
-				metadataPatches = append(metadataPatches, apihelper.NewJsonPatch("add", "/metadata/annotations", k, v))
-			}
-
-			// Create a list of expected node status patches
-			statusPatches := []apihelper.JsonPatch{}
-			for k, v := range fakeExtResources {
-				statusPatches = append(statusPatches, apihelper.NewJsonPatch("add", "/status/capacity", k, v))
-			}
-
-			mockAPIHelper.On("GetClient").Return(mockClient, nil)
-			mockAPIHelper.On("GetNode", mockClient, mockNodeName).Return(mockNode, nil).Once()
-			mockAPIHelper.On("PatchNode", mockClient, mockNodeName, mock.MatchedBy(jsonPatchMatcher(metadataPatches))).Return(nil)
-			mockAPIHelper.On("PatchNodeStatus", mockClient, mockNodeName, mock.MatchedBy(jsonPatchMatcher(statusPatches))).Return(nil)
-			err := mockMaster.updateNodeFeatures(mockNodeName, fakeFeatureLabels, fakeAnnotations, fakeExtResources)
-
+			err := fakeMaster.updateNodeObject(fakeCli, testNode, featureLabels, featureAnnotations, featureExtResources, nil)
 			Convey("Error is nil", func() {
 				So(err, ShouldBeNil)
 			})
-		})
 
-		Convey("When I fail to update the node with feature labels", func() {
-			expectedError := errors.New("fake error")
-			mockAPIHelper.On("GetClient").Return(nil, expectedError)
-			err := mockMaster.updateNodeFeatures(mockNodeName, fakeFeatureLabels, fakeAnnotations, fakeExtResources)
+			Convey("Node object is updated", func() {
+				expectedAnnotations := map[string]string{
+					nfdv1alpha1.FeatureLabelsAnnotation:              strings.Join(featureLabelNames, ","),
+					nfdv1alpha1.FeatureAnnotationsTrackingAnnotation: strings.Join(featureAnnotationNames, ","),
+					nfdv1alpha1.ExtendedResourceAnnotation:           strings.Join(featureExtResourceNames, ","),
+				}
+				maps.Copy(expectedAnnotations, featureAnnotations)
 
-			Convey("Error is produced", func() {
-				So(err, ShouldEqual, expectedError)
+				expectedCapacity := testNode.Status.Capacity.DeepCopy()
+				for k, v := range featureExtResources {
+					expectedCapacity[corev1.ResourceName(k)] = resource.MustParse(v)
+				}
+
+				// Get the node
+				updatedNode, err := fakeCli.CoreV1().Nodes().Get(context.TODO(), testNodeName, metav1.GetOptions{})
+
+				So(err, ShouldBeNil)
+				So(updatedNode.Labels, ShouldEqual, featureLabels)
+				So(updatedNode.Annotations, ShouldEqual, expectedAnnotations)
+				So(updatedNode.Status.Capacity, ShouldEqual, expectedCapacity)
 			})
 		})
 
-		Convey("When I fail to get a mock client while updating feature labels", func() {
-			expectedError := errors.New("fake error")
-			mockAPIHelper.On("GetClient").Return(nil, expectedError)
-			err := mockMaster.updateNodeFeatures(mockNodeName, fakeFeatureLabels, fakeAnnotations, fakeExtResources)
-
-			Convey("Error is produced", func() {
-				So(err, ShouldEqual, expectedError)
+		Convey("When I fail to patch a node", func() {
+			fakeCli.CoreV1().(*fakecorev1client.FakeCoreV1).PrependReactor("patch", "nodes", func(action clienttesting.Action) (handled bool, ret runtime.Object, err error) {
+				return true, &corev1.Node{}, errors.New("Fake error when patching node")
 			})
-		})
-
-		Convey("When I fail to get a mock node while updating feature labels", func() {
-			expectedError := errors.New("fake error")
-			mockAPIHelper.On("GetClient").Return(mockClient, nil)
-			mockAPIHelper.On("GetNode", mockClient, mockNodeName).Return(nil, expectedError).Once()
-			err := mockMaster.updateNodeFeatures(mockNodeName, fakeFeatureLabels, fakeAnnotations, fakeExtResources)
+			err := fakeMaster.updateNodeObject(fakeCli, testNode, nil, featureAnnotations, ExtendedResources{"": ""}, nil)
 
 			Convey("Error is produced", func() {
-				So(err, ShouldEqual, expectedError)
-			})
-		})
-
-		Convey("When I fail to update a mock node while updating feature labels", func() {
-			expectedError := errors.New("fake error")
-			mockAPIHelper.On("GetClient").Return(mockClient, nil)
-			mockAPIHelper.On("GetNode", mockClient, mockNodeName).Return(mockNode, nil).Once()
-			mockAPIHelper.On("PatchNode", mockClient, mockNodeName, mock.Anything).Return(expectedError).Once()
-			err := mockMaster.updateNodeFeatures(mockNodeName, fakeFeatureLabels, fakeAnnotations, fakeExtResources)
-
-			Convey("Error is produced", func() {
-				So(err.Error(), ShouldEndWith, expectedError.Error())
+				So(err, ShouldBeError)
 			})
 		})
 
@@ -170,47 +222,46 @@ func TestUpdateNodeFeatures(t *testing.T) {
 
 func TestUpdateMasterNode(t *testing.T) {
 	Convey("When updating the nfd-master node", t, func() {
-		mockHelper := &apihelper.MockAPIHelpers{}
-		mockMaster := newMockMaster(mockHelper)
-		mockClient := &k8sclient.Clientset{}
-		mockNode := newMockNode()
+		testNode := newTestNode()
+		testNode.Annotations["nfd.node.kubernetes.io/master.version"] = "foo"
+
 		Convey("When update operation succeeds", func() {
-			expectedPatches := []apihelper.JsonPatch{
-				apihelper.NewJsonPatch("add", "/metadata/annotations", AnnotationNsBase+"/master.version", version.Get())}
-			mockHelper.On("GetClient").Return(mockClient, nil)
-			mockHelper.On("GetNode", mockClient, mockNodeName).Return(mockNode, nil)
-			mockHelper.On("PatchNode", mockClient, mockNodeName, mock.MatchedBy(jsonPatchMatcher(expectedPatches))).Return(nil)
-			err := mockMaster.updateMasterNode()
+			fakeCli := fakeclient.NewSimpleClientset(testNode)
+			fakeMaster := newFakeMaster(WithKubernetesClient(fakeCli))
+			err := fakeMaster.updateMasterNode()
 			Convey("No error should be returned", func() {
 				So(err, ShouldBeNil)
 			})
-		})
 
-		mockErr := errors.New("failed to patch node annotations: mock-error'")
-		Convey("When getting API client fails", func() {
-			mockHelper.On("GetClient").Return(mockClient, mockErr)
-			err := mockMaster.updateMasterNode()
-			Convey("An error should be returned", func() {
-				So(err, ShouldEqual, mockErr)
+			Convey("Master version annotation was removed", func() {
+				updatedNode, err := fakeCli.CoreV1().Nodes().Get(context.TODO(), testNodeName, metav1.GetOptions{})
+				So(err, ShouldBeNil)
+				So(updatedNode.Annotations, ShouldBeEmpty)
 			})
 		})
 
 		Convey("When getting API node object fails", func() {
-			mockHelper.On("GetClient").Return(mockClient, nil)
-			mockHelper.On("GetNode", mockClient, mockNodeName).Return(mockNode, mockErr)
-			err := mockMaster.updateMasterNode()
+			fakeCli := fakeclient.NewSimpleClientset(testNode)
+			fakeMaster := newFakeMaster(WithKubernetesClient(fakeCli))
+			fakeMaster.nodeName = "does-not-exist"
+
+			err := fakeMaster.updateMasterNode()
 			Convey("An error should be returned", func() {
-				So(err, ShouldEqual, mockErr)
+				So(err, ShouldBeError)
 			})
 		})
 
 		Convey("When updating node object fails", func() {
-			mockHelper.On("GetClient").Return(mockClient, nil)
-			mockHelper.On("GetNode", mockClient, mockNodeName).Return(mockNode, nil)
-			mockHelper.On("PatchNode", mockClient, mockNodeName, mock.Anything).Return(mockErr)
-			err := mockMaster.updateMasterNode()
+			fakeErr := errors.New("Fake error when patching node")
+			fakeCli := fakeclient.NewSimpleClientset(testNode)
+			fakeCli.CoreV1().(*fakecorev1client.FakeCoreV1).PrependReactor("patch", "nodes", func(action clienttesting.Action) (handled bool, ret runtime.Object, err error) {
+				return true, &corev1.Node{}, fakeErr
+			})
+			fakeMaster := newFakeMaster(WithKubernetesClient(fakeCli))
+
+			err := fakeMaster.updateMasterNode()
 			Convey("An error should be returned", func() {
-				So(err.Error(), ShouldEndWith, mockErr.Error())
+				So(err, ShouldWrap, fakeErr)
 			})
 		})
 	})
@@ -218,42 +269,42 @@ func TestUpdateMasterNode(t *testing.T) {
 
 func TestAddingExtResources(t *testing.T) {
 	Convey("When adding extended resources", t, func() {
-		mockMaster := newMockMaster(nil)
+		fakeMaster := newFakeMaster()
 		Convey("When there are no matching labels", func() {
-			mockNode := newMockNode()
-			mockResourceLabels := ExtendedResources{}
-			patches := mockMaster.createExtendedResourcePatches(mockNode, mockResourceLabels)
+			testNode := newTestNode()
+			extendedResources := ExtendedResources{}
+			patches := fakeMaster.createExtendedResourcePatches(testNode, extendedResources)
 			So(len(patches), ShouldEqual, 0)
 		})
 
 		Convey("When there are matching labels", func() {
-			mockNode := newMockNode()
-			mockResourceLabels := ExtendedResources{"feature-1": "1", "feature-2": "2"}
-			expectedPatches := []apihelper.JsonPatch{
-				apihelper.NewJsonPatch("add", "/status/capacity", "feature-1", "1"),
-				apihelper.NewJsonPatch("add", "/status/capacity", "feature-2", "2"),
+			testNode := newTestNode()
+			extendedResources := ExtendedResources{"feature-1": "1", "feature-2": "2"}
+			expectedPatches := []utils.JsonPatch{
+				utils.NewJsonPatch("add", "/status/capacity", "feature-1", "1"),
+				utils.NewJsonPatch("add", "/status/capacity", "feature-2", "2"),
 			}
-			patches := mockMaster.createExtendedResourcePatches(mockNode, mockResourceLabels)
+			patches := fakeMaster.createExtendedResourcePatches(testNode, extendedResources)
 			So(sortJsonPatches(patches), ShouldResemble, sortJsonPatches(expectedPatches))
 		})
 
 		Convey("When the resource already exists", func() {
-			mockNode := newMockNode()
-			mockNode.Status.Capacity[api.ResourceName(FeatureLabelNs+"/feature-1")] = *resource.NewQuantity(1, resource.BinarySI)
-			mockResourceLabels := ExtendedResources{FeatureLabelNs + "/feature-1": "1"}
-			patches := mockMaster.createExtendedResourcePatches(mockNode, mockResourceLabels)
+			testNode := newTestNode()
+			testNode.Status.Capacity[corev1.ResourceName(nfdv1alpha1.FeatureLabelNs+"/feature-1")] = *resource.NewQuantity(1, resource.BinarySI)
+			extendedResources := ExtendedResources{nfdv1alpha1.FeatureLabelNs + "/feature-1": "1"}
+			patches := fakeMaster.createExtendedResourcePatches(testNode, extendedResources)
 			So(len(patches), ShouldEqual, 0)
 		})
 
 		Convey("When the resource already exists but its capacity has changed", func() {
-			mockNode := newMockNode()
-			mockNode.Status.Capacity[api.ResourceName("feature-1")] = *resource.NewQuantity(2, resource.BinarySI)
-			mockResourceLabels := ExtendedResources{"feature-1": "1"}
-			expectedPatches := []apihelper.JsonPatch{
-				apihelper.NewJsonPatch("replace", "/status/capacity", "feature-1", "1"),
-				apihelper.NewJsonPatch("replace", "/status/allocatable", "feature-1", "1"),
+			testNode := newTestNode()
+			testNode.Status.Capacity[corev1.ResourceName("feature-1")] = *resource.NewQuantity(2, resource.BinarySI)
+			extendedResources := ExtendedResources{"feature-1": "1"}
+			expectedPatches := []utils.JsonPatch{
+				utils.NewJsonPatch("replace", "/status/capacity", "feature-1", "1"),
+				utils.NewJsonPatch("replace", "/status/allocatable", "feature-1", "1"),
 			}
-			patches := mockMaster.createExtendedResourcePatches(mockNode, mockResourceLabels)
+			patches := fakeMaster.createExtendedResourcePatches(testNode, extendedResources)
 			So(sortJsonPatches(patches), ShouldResemble, sortJsonPatches(expectedPatches))
 		})
 	})
@@ -261,216 +312,178 @@ func TestAddingExtResources(t *testing.T) {
 
 func TestRemovingExtResources(t *testing.T) {
 	Convey("When removing extended resources", t, func() {
-		mockMaster := newMockMaster(nil)
+		fakeMaster := newFakeMaster()
 		Convey("When none are removed", func() {
-			mockNode := newMockNode()
-			mockResourceLabels := ExtendedResources{FeatureLabelNs + "/feature-1": "1", FeatureLabelNs + "/feature-2": "2"}
-			mockNode.Annotations[AnnotationNsBase+"/extended-resources"] = "feature-1,feature-2"
-			mockNode.Status.Capacity[api.ResourceName(FeatureLabelNs+"/feature-1")] = *resource.NewQuantity(1, resource.BinarySI)
-			mockNode.Status.Capacity[api.ResourceName(FeatureLabelNs+"/feature-2")] = *resource.NewQuantity(2, resource.BinarySI)
-			patches := mockMaster.createExtendedResourcePatches(mockNode, mockResourceLabels)
+			testNode := newTestNode()
+			extendedResources := ExtendedResources{nfdv1alpha1.FeatureLabelNs + "/feature-1": "1", nfdv1alpha1.FeatureLabelNs + "/feature-2": "2"}
+			testNode.Annotations[nfdv1alpha1.AnnotationNs+"/extended-resources"] = "feature-1,feature-2"
+			testNode.Status.Capacity[corev1.ResourceName(nfdv1alpha1.FeatureLabelNs+"/feature-1")] = *resource.NewQuantity(1, resource.BinarySI)
+			testNode.Status.Capacity[corev1.ResourceName(nfdv1alpha1.FeatureLabelNs+"/feature-2")] = *resource.NewQuantity(2, resource.BinarySI)
+			patches := fakeMaster.createExtendedResourcePatches(testNode, extendedResources)
 			So(len(patches), ShouldEqual, 0)
 		})
 		Convey("When the related label is gone", func() {
-			mockNode := newMockNode()
-			mockResourceLabels := ExtendedResources{FeatureLabelNs + "/feature-4": "", FeatureLabelNs + "/feature-2": "2"}
-			mockNode.Annotations[AnnotationNsBase+"/extended-resources"] = "feature-4,feature-2"
-			mockNode.Status.Capacity[api.ResourceName(FeatureLabelNs+"/feature-4")] = *resource.NewQuantity(4, resource.BinarySI)
-			mockNode.Status.Capacity[api.ResourceName(FeatureLabelNs+"/feature-2")] = *resource.NewQuantity(2, resource.BinarySI)
-			patches := mockMaster.createExtendedResourcePatches(mockNode, mockResourceLabels)
+			testNode := newTestNode()
+			extendedResources := ExtendedResources{nfdv1alpha1.FeatureLabelNs + "/feature-4": "", nfdv1alpha1.FeatureLabelNs + "/feature-2": "2"}
+			testNode.Annotations[nfdv1alpha1.AnnotationNs+"/extended-resources"] = "feature-4,feature-2"
+			testNode.Status.Capacity[corev1.ResourceName(nfdv1alpha1.FeatureLabelNs+"/feature-4")] = *resource.NewQuantity(4, resource.BinarySI)
+			testNode.Status.Capacity[corev1.ResourceName(nfdv1alpha1.FeatureLabelNs+"/feature-2")] = *resource.NewQuantity(2, resource.BinarySI)
+			patches := fakeMaster.createExtendedResourcePatches(testNode, extendedResources)
 			So(len(patches), ShouldBeGreaterThan, 0)
 		})
 		Convey("When the extended resource is no longer wanted", func() {
-			mockNode := newMockNode()
-			mockNode.Status.Capacity[api.ResourceName(FeatureLabelNs+"/feature-1")] = *resource.NewQuantity(1, resource.BinarySI)
-			mockNode.Status.Capacity[api.ResourceName(FeatureLabelNs+"/feature-2")] = *resource.NewQuantity(2, resource.BinarySI)
-			mockResourceLabels := ExtendedResources{FeatureLabelNs + "/feature-2": "2"}
-			mockNode.Annotations[AnnotationNsBase+"/extended-resources"] = "feature-1,feature-2"
-			patches := mockMaster.createExtendedResourcePatches(mockNode, mockResourceLabels)
+			testNode := newTestNode()
+			testNode.Status.Capacity[corev1.ResourceName(nfdv1alpha1.FeatureLabelNs+"/feature-1")] = *resource.NewQuantity(1, resource.BinarySI)
+			testNode.Status.Capacity[corev1.ResourceName(nfdv1alpha1.FeatureLabelNs+"/feature-2")] = *resource.NewQuantity(2, resource.BinarySI)
+			extendedResources := ExtendedResources{nfdv1alpha1.FeatureLabelNs + "/feature-2": "2"}
+			testNode.Annotations[nfdv1alpha1.AnnotationNs+"/extended-resources"] = "feature-1,feature-2"
+			patches := fakeMaster.createExtendedResourcePatches(testNode, extendedResources)
 			So(len(patches), ShouldBeGreaterThan, 0)
 		})
 	})
 }
 
-func TestSetLabels(t *testing.T) {
-	Convey("When servicing SetLabels request", t, func() {
-		const workerName = "mock-worker"
-		const workerVer = "0.1-test"
-		mockHelper := &apihelper.MockAPIHelpers{}
-		mockMaster := newMockMaster(mockHelper)
-		mockClient := &k8sclient.Clientset{}
-		mockNode := newMockNode()
-		mockCtx := context.Background()
-		// In the gRPC request the label names may omit the default ns
-		mockLabels := map[string]string{"feature-1": "1", "feature-2": "val-2", "feature-3": "3"}
-		mockReq := &labeler.SetLabelsRequest{NodeName: workerName, NfdVersion: workerVer, Labels: mockLabels}
+func TestFilterLabels(t *testing.T) {
+	fakeMaster := newFakeMaster()
+	fakeMaster.config.ExtraLabelNs = map[string]struct{}{"example.io": {}}
+	fakeMaster.deniedNs = deniedNs{
+		normal:   map[string]struct{}{"": {}, "kubernetes.io": {}, "denied.ns": {}},
+		wildcard: map[string]struct{}{".kubernetes.io": {}, ".denied.subns": {}},
+	}
 
-		mockLabelNames := make([]string, 0, len(mockLabels))
-		for k := range mockLabels {
-			mockLabelNames = append(mockLabelNames, k)
-		}
-		sort.Strings(mockLabelNames)
+	type TC struct {
+		description   string
+		labelName     string
+		labelValue    string
+		features      nfdv1alpha1.Features
+		expectErr     bool
+		expectedValue string
+	}
 
-		expectedStatusPatches := []apihelper.JsonPatch{}
+	tcs := []TC{
+		{
+			description:   "Static value",
+			labelName:     "example.io/test",
+			labelValue:    "test-val",
+			expectedValue: "test-val",
+		},
+		{
+			description: "Dynamic value",
+			labelName:   "example.io/testLabel",
+			labelValue:  "@test.feature.LSM",
+			features: nfdv1alpha1.Features{
+				Attributes: map[string]nfdv1alpha1.AttributeFeatureSet{
+					"test.feature": {
+						Elements: map[string]string{
+							"LSM": "123",
+						},
+					},
+				},
+			},
+			expectedValue: "123",
+		},
+		{
+			description: "Unprefixed should be denied",
+			labelName:   "test-label",
+			labelValue:  "test-value",
+			expectErr:   true,
+		},
+		{
+			description: "kubernetes.io ns should be denied",
+			labelName:   "kubernetes.io/test-label",
+			labelValue:  "test-value",
+			expectErr:   true,
+		},
+		{
+			description: "*.kubernetes.io ns should be denied",
+			labelName:   "sub.ns.kubernetes.io/test-label",
+			labelValue:  "test-value",
+			expectErr:   true,
+		},
+		{
+			description: "denied.ns ns should be denied",
+			labelName:   "denied.ns/test-label",
+			labelValue:  "test-value",
+			expectErr:   true,
+		},
+		{
+			description: "*.denied.subns ns should be denied",
+			labelName:   "my.denied.subns/test-label",
+			labelValue:  "test-value",
+			expectErr:   true,
+		},
+	}
 
-		wvAnnotation := path.Join(AnnotationNsBase, workerVersionAnnotation)
-		flAnnotation := path.Join(AnnotationNsBase, featureLabelAnnotation)
-		erAnnotation := path.Join(AnnotationNsBase, extendedResourceAnnotation)
-		Convey("When node update succeeds", func() {
-			expectedPatches := []apihelper.JsonPatch{
-				apihelper.NewJsonPatch("add", "/metadata/annotations", wvAnnotation, workerVer),
-				apihelper.NewJsonPatch("add", "/metadata/annotations", flAnnotation, strings.Join(mockLabelNames, ",")),
-				apihelper.NewJsonPatch("add", "/metadata/annotations", erAnnotation, ""),
+	for _, tc := range tcs {
+		t.Run(tc.description, func(t *testing.T) {
+			labelValue, err := fakeMaster.filterFeatureLabel(tc.labelName, tc.labelValue, &tc.features)
+
+			if tc.expectErr {
+				Convey("Label should be filtered out", t, func() {
+					So(err, ShouldBeError)
+				})
+			} else {
+				Convey("Label should not be filtered out", t, func() {
+					So(err, ShouldBeNil)
+				})
+				Convey("Label value should be correct", t, func() {
+					So(labelValue, ShouldEqual, tc.expectedValue)
+				})
 			}
-			for k, v := range mockLabels {
-				expectedPatches = append(expectedPatches, apihelper.NewJsonPatch("add", "/metadata/labels", FeatureLabelNs+"/"+k, v))
-			}
-
-			mockHelper.On("GetClient").Return(mockClient, nil)
-			mockHelper.On("GetNode", mockClient, workerName).Return(mockNode, nil)
-			mockHelper.On("PatchNode", mockClient, mockNodeName, mock.MatchedBy(jsonPatchMatcher(expectedPatches))).Return(nil)
-			mockHelper.On("PatchNodeStatus", mockClient, mockNodeName, mock.MatchedBy(jsonPatchMatcher(expectedStatusPatches))).Return(nil)
-			_, err := mockMaster.SetLabels(mockCtx, mockReq)
-			Convey("No error should be returned", func() {
-				So(err, ShouldBeNil)
-			})
 		})
-
-		Convey("When -label-whitelist is specified", func() {
-			expectedPatches := []apihelper.JsonPatch{
-				apihelper.NewJsonPatch("add", "/metadata/annotations", wvAnnotation, workerVer),
-				apihelper.NewJsonPatch("add", "/metadata/annotations", flAnnotation, "feature-2"),
-				apihelper.NewJsonPatch("add", "/metadata/annotations", erAnnotation, ""),
-				apihelper.NewJsonPatch("add", "/metadata/labels", FeatureLabelNs+"/feature-2", mockLabels["feature-2"]),
-			}
-
-			mockMaster.args.LabelWhiteList.Regexp = *regexp.MustCompile("^f.*2$")
-			mockHelper.On("GetClient").Return(mockClient, nil)
-			mockHelper.On("GetNode", mockClient, workerName).Return(mockNode, nil)
-			mockHelper.On("PatchNode", mockClient, mockNodeName, mock.MatchedBy(jsonPatchMatcher(expectedPatches))).Return(nil)
-			mockHelper.On("PatchNodeStatus", mockClient, mockNodeName, mock.MatchedBy(jsonPatchMatcher(expectedStatusPatches))).Return(nil)
-			_, err := mockMaster.SetLabels(mockCtx, mockReq)
-			Convey("Error is nil", func() {
-				So(err, ShouldBeNil)
-			})
-		})
-
-		Convey("When -extra-label-ns and -instance are specified", func() {
-			// In the gRPC request the label names may omit the default ns
-			instance := "foo"
-			vendorFeatureLabel := "vendor." + FeatureLabelNs + "/feature-4"
-			vendorProfileLabel := "vendor." + ProfileLabelNs + "/feature-5"
-			mockLabels := map[string]string{"feature-1": "val-1",
-				"valid.ns/feature-2":   "val-2",
-				"invalid.ns/feature-3": "val-3",
-				vendorFeatureLabel:     " val-4",
-				vendorProfileLabel:     " val-5"}
-			expectedPatches := []apihelper.JsonPatch{
-				apihelper.NewJsonPatch("add", "/metadata/annotations", instance+"."+wvAnnotation, workerVer),
-				apihelper.NewJsonPatch("add", "/metadata/annotations",
-					instance+"."+flAnnotation,
-					"feature-1,valid.ns/feature-2,"+vendorFeatureLabel+","+vendorProfileLabel),
-				apihelper.NewJsonPatch("add", "/metadata/annotations", instance+"."+erAnnotation, ""),
-				apihelper.NewJsonPatch("add", "/metadata/labels", FeatureLabelNs+"/feature-1", mockLabels["feature-1"]),
-				apihelper.NewJsonPatch("add", "/metadata/labels", "valid.ns/feature-2", mockLabels["valid.ns/feature-2"]),
-				apihelper.NewJsonPatch("add", "/metadata/labels", vendorFeatureLabel, mockLabels[vendorFeatureLabel]),
-				apihelper.NewJsonPatch("add", "/metadata/labels", vendorProfileLabel, mockLabels[vendorProfileLabel]),
-			}
-
-			mockMaster.args.ExtraLabelNs = map[string]struct{}{"valid.ns": {}}
-			mockMaster.annotationNs = instance + "." + AnnotationNsBase
-			mockHelper.On("GetClient").Return(mockClient, nil)
-			mockHelper.On("GetNode", mockClient, workerName).Return(mockNode, nil)
-			mockHelper.On("PatchNode", mockClient, mockNodeName, mock.MatchedBy(jsonPatchMatcher(expectedPatches))).Return(nil)
-			mockHelper.On("PatchNodeStatus", mockClient, mockNodeName, mock.MatchedBy(jsonPatchMatcher(expectedStatusPatches))).Return(nil)
-			mockReq := &labeler.SetLabelsRequest{NodeName: workerName, NfdVersion: workerVer, Labels: mockLabels}
-			_, err := mockMaster.SetLabels(mockCtx, mockReq)
-			Convey("Error is nil", func() {
-				So(err, ShouldBeNil)
-			})
-			mockMaster.annotationNs = AnnotationNsBase
-		})
-
-		Convey("When -resource-labels is specified", func() {
-			expectedPatches := []apihelper.JsonPatch{
-				apihelper.NewJsonPatch("add", "/metadata/annotations", wvAnnotation, workerVer),
-				apihelper.NewJsonPatch("add", "/metadata/annotations", flAnnotation, "feature-2"),
-				apihelper.NewJsonPatch("add", "/metadata/annotations", erAnnotation, "feature-1,feature-3"),
-				apihelper.NewJsonPatch("add", "/metadata/labels", FeatureLabelNs+"/feature-2", mockLabels["feature-2"]),
-			}
-			expectedStatusPatches := []apihelper.JsonPatch{
-				apihelper.NewJsonPatch("add", "/status/capacity", FeatureLabelNs+"/feature-1", mockLabels["feature-1"]),
-				apihelper.NewJsonPatch("add", "/status/capacity", FeatureLabelNs+"/feature-3", mockLabels["feature-3"]),
-			}
-
-			mockMaster.args.ResourceLabels = map[string]struct{}{"feature-3": {}, "feature-1": {}}
-			mockHelper.On("GetClient").Return(mockClient, nil)
-			mockHelper.On("GetNode", mockClient, workerName).Return(mockNode, nil)
-			mockHelper.On("PatchNode", mockClient, mockNodeName, mock.MatchedBy(jsonPatchMatcher(expectedPatches))).Return(nil)
-			mockHelper.On("PatchNodeStatus", mockClient, mockNodeName, mock.MatchedBy(jsonPatchMatcher(expectedStatusPatches))).Return(nil)
-			_, err := mockMaster.SetLabels(mockCtx, mockReq)
-			Convey("Error is nil", func() {
-				So(err, ShouldBeNil)
-			})
-		})
-
-		mockErr := errors.New("mock-error")
-		Convey("When node update fails", func() {
-			mockHelper.On("GetClient").Return(mockClient, mockErr)
-			_, err := mockMaster.SetLabels(mockCtx, mockReq)
-			Convey("An error should be returned", func() {
-				So(err, ShouldEqual, mockErr)
-			})
-		})
-
-		mockMaster.args.NoPublish = true
-		Convey("With '-no-publish'", func() {
-			_, err := mockMaster.SetLabels(mockCtx, mockReq)
-			Convey("Operation should succeed", func() {
-				So(err, ShouldBeNil)
-			})
-		})
-	})
+	}
 }
 
 func TestCreatePatches(t *testing.T) {
 	Convey("When creating JSON patches", t, func() {
 		existingItems := map[string]string{"key-1": "val-1", "key-2": "val-2", "key-3": "val-3"}
+		overwriteKeys := true
 		jsonPath := "/root"
 
-		Convey("When when there are neither itmes to remoe nor to add or update", func() {
-			p := createPatches([]string{"foo", "bar"}, existingItems, map[string]string{}, jsonPath)
+		Convey("When there are neither itmes to remoe nor to add or update", func() {
+			p := createPatches(sets.New([]string{"foo", "bar"}...), existingItems, map[string]string{}, jsonPath, overwriteKeys)
 			So(len(p), ShouldEqual, 0)
 		})
 
-		Convey("When when there are itmes to remoe but none to add or update", func() {
-			p := createPatches([]string{"key-2", "key-3", "foo"}, existingItems, map[string]string{}, jsonPath)
-			expected := []apihelper.JsonPatch{
-				apihelper.NewJsonPatch("remove", jsonPath, "key-2", ""),
-				apihelper.NewJsonPatch("remove", jsonPath, "key-3", ""),
+		Convey("When there are itmes to remoe but none to add or update", func() {
+			p := createPatches(sets.New([]string{"key-2", "key-3", "foo"}...), existingItems, map[string]string{}, jsonPath, overwriteKeys)
+			expected := []utils.JsonPatch{
+				utils.NewJsonPatch("remove", jsonPath, "key-2", ""),
+				utils.NewJsonPatch("remove", jsonPath, "key-3", ""),
 			}
 			So(sortJsonPatches(p), ShouldResemble, sortJsonPatches(expected))
 		})
 
-		Convey("When when there are no itmes to remove but new items to add", func() {
+		Convey("When there are no itmes to remove but new items to add", func() {
 			newItems := map[string]string{"new-key": "new-val", "key-1": "new-1"}
-			p := createPatches([]string{"key-1"}, existingItems, newItems, jsonPath)
-			expected := []apihelper.JsonPatch{
-				apihelper.NewJsonPatch("add", jsonPath, "new-key", newItems["new-key"]),
-				apihelper.NewJsonPatch("replace", jsonPath, "key-1", newItems["key-1"]),
+			p := createPatches(sets.New([]string{"key-1"}...), existingItems, newItems, jsonPath, overwriteKeys)
+			expected := []utils.JsonPatch{
+				utils.NewJsonPatch("add", jsonPath, "new-key", newItems["new-key"]),
+				utils.NewJsonPatch("replace", jsonPath, "key-1", newItems["key-1"]),
 			}
 			So(sortJsonPatches(p), ShouldResemble, sortJsonPatches(expected))
 		})
 
-		Convey("When when there are items to remove add and update", func() {
+		Convey("When there are items to remove add and update", func() {
 			newItems := map[string]string{"new-key": "new-val", "key-2": "new-2", "key-4": "val-4"}
-			p := createPatches([]string{"key-1", "key-2", "key-3", "foo"}, existingItems, newItems, jsonPath)
-			expected := []apihelper.JsonPatch{
-				apihelper.NewJsonPatch("add", jsonPath, "new-key", newItems["new-key"]),
-				apihelper.NewJsonPatch("add", jsonPath, "key-4", newItems["key-4"]),
-				apihelper.NewJsonPatch("replace", jsonPath, "key-2", newItems["key-2"]),
-				apihelper.NewJsonPatch("remove", jsonPath, "key-1", ""),
-				apihelper.NewJsonPatch("remove", jsonPath, "key-3", ""),
+			p := createPatches(sets.New([]string{"key-1", "key-2", "key-3", "foo"}...), existingItems, newItems, jsonPath, overwriteKeys)
+			expected := []utils.JsonPatch{
+				utils.NewJsonPatch("add", jsonPath, "new-key", newItems["new-key"]),
+				utils.NewJsonPatch("add", jsonPath, "key-4", newItems["key-4"]),
+				utils.NewJsonPatch("replace", jsonPath, "key-2", newItems["key-2"]),
+				utils.NewJsonPatch("remove", jsonPath, "key-1", ""),
+				utils.NewJsonPatch("remove", jsonPath, "key-3", ""),
+			}
+			So(sortJsonPatches(p), ShouldResemble, sortJsonPatches(expected))
+		})
+
+		Convey("When overwrite of keys is denied and there is already an existant key", func() {
+			overwriteKeys = false
+			newItems := map[string]string{"key-1": "new-2", "key-4": "val-4"}
+			p := createPatches(sets.New([]string{}...), existingItems, newItems, jsonPath, overwriteKeys)
+			expected := []utils.JsonPatch{
+				utils.NewJsonPatch("add", jsonPath, "key-4", newItems["key-4"]),
+				utils.NewJsonPatch("replace", jsonPath, "key-1", newItems["key-1"]),
 			}
 			So(sortJsonPatches(p), ShouldResemble, sortJsonPatches(expected))
 		})
@@ -479,8 +492,8 @@ func TestCreatePatches(t *testing.T) {
 
 func TestRemoveLabelsWithPrefix(t *testing.T) {
 	Convey("When removing labels", t, func() {
-		n := &api.Node{
-			ObjectMeta: meta_v1.ObjectMeta{
+		n := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{
 				Labels: map[string]string{
 					"single-label": "123",
 					"multiple_A":   "a",
@@ -491,14 +504,14 @@ func TestRemoveLabelsWithPrefix(t *testing.T) {
 
 		Convey("a unique label should be removed", func() {
 			p := removeLabelsWithPrefix(n, "single")
-			So(p, ShouldResemble, []apihelper.JsonPatch{apihelper.NewJsonPatch("remove", "/metadata/labels", "single-label", "")})
+			So(p, ShouldResemble, []utils.JsonPatch{utils.NewJsonPatch("remove", "/metadata/labels", "single-label", "")})
 		})
 
 		Convey("a non-unique search string should remove all matching keys", func() {
 			p := removeLabelsWithPrefix(n, "multiple")
-			So(sortJsonPatches(p), ShouldResemble, sortJsonPatches([]apihelper.JsonPatch{
-				apihelper.NewJsonPatch("remove", "/metadata/labels", "multiple_A", ""),
-				apihelper.NewJsonPatch("remove", "/metadata/labels", "multiple_B", ""),
+			So(sortJsonPatches(p), ShouldResemble, sortJsonPatches([]utils.JsonPatch{
+				utils.NewJsonPatch("remove", "/metadata/labels", "multiple_A", ""),
+				utils.NewJsonPatch("remove", "/metadata/labels", "multiple_B", ""),
 			}))
 		})
 
@@ -512,24 +525,221 @@ func TestRemoveLabelsWithPrefix(t *testing.T) {
 	})
 }
 
-func jsonPatchMatcher(expected []apihelper.JsonPatch) func([]apihelper.JsonPatch) bool {
-	return func(actual []apihelper.JsonPatch) bool {
-		// We don't care about modifying the original slices
-		ok, msg := assertions.So(sortJsonPatches(actual), ShouldResemble, sortJsonPatches(expected))
-		if !ok {
-			// We parse the cryptic string message for better readability
-			var f assertions.FailureView
-			if err := yaml.Unmarshal([]byte(msg), &f); err == nil {
-				_, _ = Printf("%s\n", f.Message)
-			} else {
-				_, _ = Printf("%s\n", msg)
-			}
+func TestConfigParse(t *testing.T) {
+	Convey("When parsing configuration", t, func() {
+		master := newFakeMaster()
+		overrides := `{"noPublish": true, "enableTaints": true, "extraLabelNs": ["added.ns.io","added.kubernetes.io"], "denyLabelNs": ["denied.ns.io","denied.kubernetes.io"], "labelWhiteList": "foo"}`
+
+		Convey("and no core cmdline flags have been specified", func() {
+			So(master.configure("non-existing-file", overrides), ShouldBeNil)
+			Convey("overrides should be in effect", func() {
+				So(master.config.NoPublish, ShouldResemble, true)
+				So(master.config.EnableTaints, ShouldResemble, true)
+				So(master.config.ExtraLabelNs, ShouldResemble, utils.StringSetVal{"added.ns.io": struct{}{}, "added.kubernetes.io": struct{}{}})
+				So(master.config.DenyLabelNs, ShouldResemble, utils.StringSetVal{"denied.ns.io": struct{}{}, "denied.kubernetes.io": struct{}{}})
+				So(master.config.LabelWhiteList.String(), ShouldEqual, "foo")
+			})
+		})
+		Convey("and a non-accessible file, but cmdline flags and some overrides are specified", func() {
+			master.args = Args{Overrides: ConfigOverrideArgs{
+				ExtraLabelNs: &utils.StringSetVal{"override.added.ns.io": struct{}{}},
+				DenyLabelNs:  &utils.StringSetVal{"override.denied.ns.io": struct{}{}}}}
+			So(master.configure("non-existing-file", overrides), ShouldBeNil)
+
+			Convey("cmdline flags should be in effect instead overrides", func() {
+				So(master.config.ExtraLabelNs, ShouldResemble, utils.StringSetVal{"override.added.ns.io": struct{}{}})
+				So(master.config.DenyLabelNs, ShouldResemble, utils.StringSetVal{"override.denied.ns.io": struct{}{}})
+			})
+			Convey("overrides should take effect", func() {
+				So(master.config.NoPublish, ShouldBeTrue)
+				So(master.config.EnableTaints, ShouldBeTrue)
+			})
+		})
+		// Create a temporary config file
+		f, err := os.CreateTemp("", "nfd-test-")
+		defer os.Remove(f.Name())
+		So(err, ShouldBeNil)
+		_, err = f.WriteString(`
+noPublish: true
+denyLabelNs: ["denied.ns.io","denied.kubernetes.io"]
+enableTaints: false
+labelWhiteList: "foo"
+leaderElection:
+  leaseDuration: 20s
+  renewDeadline: 4s
+  retryPeriod: 30s
+`)
+		f.Close()
+		So(err, ShouldBeNil)
+
+		Convey("and a proper config file is specified", func() {
+			master.args = Args{Overrides: ConfigOverrideArgs{ExtraLabelNs: &utils.StringSetVal{"override.added.ns.io": struct{}{}}}}
+			So(master.configure(f.Name(), ""), ShouldBeNil)
+			Convey("specified configuration should take effect", func() {
+				// Verify core config
+				So(master.config.NoPublish, ShouldBeTrue)
+				So(master.config.EnableTaints, ShouldBeFalse)
+				So(master.config.ExtraLabelNs, ShouldResemble, utils.StringSetVal{"override.added.ns.io": struct{}{}})
+				So(master.config.DenyLabelNs, ShouldResemble, utils.StringSetVal{"denied.ns.io": struct{}{}, "denied.kubernetes.io": struct{}{}})
+				So(master.config.LabelWhiteList.String(), ShouldEqual, "foo")
+				So(master.config.LeaderElection.LeaseDuration.Seconds(), ShouldEqual, float64(20))
+				So(master.config.LeaderElection.RenewDeadline.Seconds(), ShouldEqual, float64(4))
+				So(master.config.LeaderElection.RetryPeriod.Seconds(), ShouldEqual, float64(30))
+			})
+		})
+
+		Convey("and a proper config file and overrides are given", func() {
+			master.args = Args{Overrides: ConfigOverrideArgs{DenyLabelNs: &utils.StringSetVal{"denied.ns.io": struct{}{}}}}
+			overrides := `{"extraLabelNs": ["added.ns.io"], "noPublish": true}`
+			So(master.configure(f.Name(), overrides), ShouldBeNil)
+
+			Convey("overrides should take precedence over the config file", func() {
+				// Verify core config
+				So(master.config.ExtraLabelNs, ShouldResemble, utils.StringSetVal{"added.ns.io": struct{}{}}) // from overrides
+				So(master.config.DenyLabelNs, ShouldResemble, utils.StringSetVal{"denied.ns.io": struct{}{}}) // from cmdline
+			})
+		})
+	})
+}
+
+func newTestNodeList() *corev1.NodeList {
+	l := corev1.NodeList{}
+
+	for i := 0; i < 1000; i++ {
+		n := corev1.Node{}
+		n.Name = fmt.Sprintf("node %v", i)
+		n.Labels = map[string]string{}
+		n.Annotations = map[string]string{}
+		n.Status.Capacity = corev1.ResourceList{}
+
+		l.Items = append(l.Items, n)
+	}
+	return &l
+}
+
+func BenchmarkNfdAPIUpdateAllNodes(b *testing.B) {
+	fakeCli := fakeclient.NewSimpleClientset(newTestNodeList())
+	fakeMaster := newFakeMaster(WithKubernetesClient(fakeCli))
+	fakeMaster.nfdController = newFakeNfdAPIController(fakenfdclient.NewSimpleClientset())
+
+	updaterPool := newUpdaterPool(fakeMaster)
+	fakeMaster.updaterPool = updaterPool
+
+	updaterPool.start(10)
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_ = fakeMaster.nfdAPIUpdateAllNodes()
+	}
+	fmt.Println(b.Elapsed())
+}
+
+// withTimeout is a custom assertion for polling a value asynchronously
+// actual is a function for getting the actual value
+// expected[0] is a time.Duration value specifying the timeout
+// expected[1] is  the "real" assertion function to be called
+// expected[2:] are the arguments for the "real" assertion function
+func withTimeout(actual interface{}, expected ...interface{}) string {
+	getter, ok := actual.(func() interface{})
+	if !ok {
+		return "not getterFunc"
+	}
+	t, ok := expected[0].(time.Duration)
+	if !ok {
+		return "not time.Duration"
+	}
+	f, ok := expected[1].(func(interface{}, ...interface{}) string)
+	if !ok {
+		return "not an assert func"
+	}
+	timeout := time.After(t)
+	for {
+		result := f(getter(), expected[2:]...)
+		if result == "" {
+			return ""
 		}
-		return ok
+		select {
+		case <-timeout:
+			return result
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 }
 
-func sortJsonPatches(p []apihelper.JsonPatch) []apihelper.JsonPatch {
+func sortJsonPatches(p []utils.JsonPatch) []utils.JsonPatch {
 	sort.Slice(p, func(i, j int) bool { return p[i].Path < p[j].Path })
 	return p
+}
+
+// Remove any labels having the given prefix
+func removeLabelsWithPrefix(n *corev1.Node, search string) []utils.JsonPatch {
+	var p []utils.JsonPatch
+
+	for k := range n.Labels {
+		if strings.HasPrefix(k, search) {
+			p = append(p, utils.NewJsonPatch("remove", "/metadata/labels", k, ""))
+		}
+	}
+
+	return p
+}
+
+func TestGetDynamicValue(t *testing.T) {
+	tests := []struct {
+		name     string
+		value    string
+		features *nfdv1alpha1.Features
+		want     string
+		fail     bool
+	}{
+		{
+			name:  "Valid dynamic value",
+			value: "@test.feature.LSM",
+			features: &nfdv1alpha1.Features{
+				Attributes: map[string]nfdv1alpha1.AttributeFeatureSet{
+					"test.feature": {
+						Elements: map[string]string{
+							"LSM": "123",
+						},
+					},
+				},
+			},
+			want: "123",
+			fail: false,
+		},
+		{
+			name:     "Invalid feature name",
+			value:    "@invalid",
+			features: &nfdv1alpha1.Features{},
+			want:     "",
+			fail:     true,
+		},
+		{
+			name:     "Element not found",
+			value:    "@test.feature.LSM",
+			features: &nfdv1alpha1.Features{},
+			want:     "",
+			fail:     true,
+		},
+		{
+			name:     "Invalid dynamic value",
+			value:    "@test.feature.LSM",
+			features: &nfdv1alpha1.Features{},
+			want:     "",
+			fail:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := getDynamicValue(tt.value, tt.features)
+			if err != nil && !tt.fail {
+				t.Errorf("getDynamicValue() = %v, want %v", err, tt.want)
+			}
+			if got != tt.want {
+				t.Errorf("getDynamicValue() = %v, want %v", got, tt.want)
+			}
+		})
+	}
 }

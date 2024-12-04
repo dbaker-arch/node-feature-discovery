@@ -8,15 +8,76 @@ imagePullSecrets: []
 
 nameOverride: ""
 fullnameOverride: ""
+namespaceOverride: ""
 
-nodeFeatureRule:
-  createCRD: true
+featureGates:
+  NodeFeatureAPI: true
+  NodeFeatureGroupAPI: false
+
+priorityClassName: ""
 
 master:
+  enable: true
+  extraArgs: []
+  extraEnvs: []
+  hostNetwork: false
+  config: ### <NFD-MASTER-CONF-START-DO-NOT-REMOVE>
+    # noPublish: false
+    # autoDefaultNs: true
+    # extraLabelNs: ["added.ns.io","added.kubernets.io"]
+    # denyLabelNs: ["denied.ns.io","denied.kubernetes.io"]
+    # enableTaints: false
+    # labelWhiteList: "foo"
+    # resyncPeriod: "2h"
+    # restrictions:
+    #   disableLabels: true
+    #   disableTaints: true
+    #   disableExtendedResources: true
+    #   disableAnnotations: true
+    #   allowOverwrite: false
+    #   denyNodeFeatureLabels: true
+    #   nodeFeatureNamespaceSelector:
+    #    matchLabels:
+    #      kubernetes.io/metadata.name: "node-feature-discovery"
+    #    matchExpressions:
+    #      - key: "kubernetes.io/metadata.name"
+    #        operator: "In"
+    #        values:
+    #           - "node-feature-discovery"
+    # klog:
+    #    addDirHeader: false
+    #    alsologtostderr: false
+    #    logBacktraceAt:
+    #    logtostderr: true
+    #    skipHeaders: false
+    #    stderrthreshold: 2
+    #    v: 0
+    #    vmodule:
+    ##   NOTE: the following options are not dynamically run-time configurable
+    ##         and require a nfd-master restart to take effect after being changed
+    #    logDir:
+    #    logFile:
+    #    logFileMaxSize: 1800
+    #    skipLogHeaders: false
+    # leaderElection:
+    #   leaseDuration: 15s
+    #   # this value has to be lower than leaseDuration and greater than retryPeriod*1.2
+    #   renewDeadline: 10s
+    #   # this value has to be greater than 0
+    #   retryPeriod: 2s
+    # nfdApiParallelism: 10
+  ### <NFD-MASTER-CONF-END-DO-NOT-REMOVE>
+  metricsPort: 8081
+  healthPort: 8082
   instance:
+  featureApi:
+  resyncPeriod:
+  denyLabelNs: []
   extraLabelNs: []
+  enableTaints: false
   featureRulesController: null
-
+  nfdApiParallelism: null
+  deploymentAnnotations: {}
   replicaCount: 1
 
   podSecurityContext: {}
@@ -39,6 +100,9 @@ master:
     # If not set and create is true, a name is generated using the fullname template
     name:
 
+  # specify how many old ReplicaSets for the Deployment to retain.
+  revisionHistoryLimit:
+
   rbac:
     create: true
 
@@ -46,17 +110,17 @@ master:
     type: ClusterIP
     port: 8080
 
-  resources: {}
-    # We usually recommend not to specify default resources and to leave this as a conscious
-    # choice for the user. This also increases chances charts run on environments with little
-    # resources, such as Minikube. If you do want to specify resources, uncomment the following
-    # lines, adjust them as necessary, and remove the curly braces after 'resources:'.
-    # limits:
-    #   cpu: 100m
-    #   memory: 128Mi
-    # requests:
-    #   cpu: 100m
-    #   memory: 128Mi
+  resources:
+    limits:
+      memory: 4Gi
+    requests:
+      cpu: 100m
+      # You may want to use the same value for `requests.memory` and `limits.memory`. The “requests” value affects scheduling to accommodate pods on nodes.
+      # If there is a large difference between “requests” and “limits” and nodes experience memory pressure, the kernel may invoke
+      # the OOM Killer, even if the memory does not exceed the “limits” threshold. This can cause unexpected pod evictions. Memory
+      # cannot be compressed and once allocated to a pod, it can only be reclaimed by killing the pod.
+      # Natan Yellin 22/09/2022 https://home.robusta.dev/blog/kubernetes-memory-limit
+      memory: 128Mi
 
   nodeSelector: {}
 
@@ -87,8 +151,28 @@ master:
               - key: "node-role.kubernetes.io/control-plane"
                 operator: In
                 values: [""]
+                
+  livenessProbe:
+    grpc:
+      port: 8082
+    initialDelaySeconds: 10
+    # failureThreshold: 3
+    # periodSeconds: 10
+    # timeoutSeconds: 1
+  readinessProbe:
+    grpc:
+      port: 8082
+    initialDelaySeconds: 5
+    failureThreshold: 10
+    # periodSeconds: 10
+    # timeoutSeconds: 1
+    # successThreshold: 1
 
 worker:
+  enable: true
+  extraArgs: []
+  extraEnvs: []
+  hostNetwork: false
   config: ### <NFD-WORKER-CONF-START-DO-NOT-REMOVE>
     #core:
     #  labelWhiteList:
@@ -116,6 +200,7 @@ worker:
     #    cpuid:
     ##     NOTE: whitelist has priority over blacklist
     #      attributeBlacklist:
+    #        - "AVX10"
     #        - "BMI1"
     #        - "BMI2"
     #        - "CLMUL"
@@ -139,6 +224,7 @@ worker:
     #        - "SSE4"
     #        - "SSE42"
     #        - "SSSE3"
+    #        - "TDX_GUEST"
     #      attributeWhitelist:
     #  kernel:
     #    kconfigFile: "/path/to/kconfig"
@@ -171,7 +257,7 @@ worker:
     #    # The following feature demonstrates the capabilities of the matchFeatures
     #    - name: "my custom rule"
     #      labels:
-    #        my-ng-feature: "true"
+    #        "vendor.io/my-ng-feature": "true"
     #      # matchFeatures implements a logical AND over all matcher terms in the
     #      # list (i.e. all of the terms, or per-feature matchers, must match)
     #      matchFeatures:
@@ -242,7 +328,7 @@ worker:
     #    # The following feature demonstrates the capabilities of the matchAny
     #    - name: "my matchAny rule"
     #      labels:
-    #        my-ng-feature-2: "my-value"
+    #        "vendor.io/my-ng-feature-2": "my-value"
     #      # matchAny implements a logical IF over all elements (sub-matchers) in
     #      # the list (i.e. at least one feature matcher must match)
     #      matchAny:
@@ -263,10 +349,17 @@ worker:
     #                vendor: {op: In, value: ["8086"]}
     #                class: {op: In, value: ["02"]}
     #
+    #    - name: "avx wildcard rule"
+    #      labels:
+    #        "my-avx-feature": "true"
+    #      matchFeatures:
+    #        - feature: cpu.cpuid
+    #          matchName: {op: InRegexp, value: ["^AVX512"]}
+    #
     #    # The following features demonstreate label templating capabilities
     #    - name: "my template rule"
     #      labelsTemplate: |
-    #        {{ range .system.osrelease }}my-system-feature.{{ .Name }}={{ .Value }}
+    #        {{ range .system.osrelease }}vendor.io/my-system-feature.{{ .Name }}={{ .Value }}
     #        {{ end }}
     #      matchFeatures:
     #        - feature: system.osrelease
@@ -276,7 +369,7 @@ worker:
     #
     #    - name: "my template rule 2"
     #      labelsTemplate: |
-    #        {{ range .pci.device }}my-pci-device.{{ .class }}-{{ .device }}=with-cpuid
+    #        {{ range .pci.device }}vendor.io/my-pci-device.{{ .class }}-{{ .device }}=with-cpuid
     #        {{ end }}
     #      matchFeatures:
     #        - feature: pci.device
@@ -291,7 +384,7 @@ worker:
     #    # previous labels and vars
     #    - name: "my dummy kernel rule"
     #      labels:
-    #        "my.kernel.feature": "true"
+    #        "vendor.io/my.kernel.feature": "true"
     #      matchFeatures:
     #        - feature: kernel.version
     #          matchExpressions:
@@ -306,15 +399,25 @@ worker:
     #
     #    - name: "my rule using backrefs"
     #      labels:
-    #        "my.backref.feature": "true"
+    #        "vendor.io/my.backref.feature": "true"
     #      matchFeatures:
     #        - feature: rule.matched
     #          matchExpressions:
-    #            my.kernel.feature: {op: IsTrue}
+    #            vendor.io/my.kernel.feature: {op: IsTrue}
     #            my.dummy.var: {op: Gt, value: ["0"]}
     #
+    #    - name: "kconfig template rule"
+    #      labelsTemplate: |
+    #        {{ range .kernel.config }}kconfig-{{ .Name }}={{ .Value }}
+    #        {{ end }}
+    #      matchFeatures:
+    #        - feature: kernel.config
+    #          matchName: {op: In, value: ["SWAP", "X86", "ARM"]}
 ### <NFD-WORKER-CONF-END-DO-NOT-REMOVE>
 
+  metricsPort: 8081
+  healthPort: 8082
+  daemonsetAnnotations: {}
   podSecurityContext: {}
     # fsGroup: 2000
 
@@ -326,21 +429,48 @@ worker:
     runAsNonRoot: true
     # runAsUser: 1000
 
+  livenessProbe:
+    grpc:
+      port: 8082
+    initialDelaySeconds: 10
+    # failureThreshold: 3
+    # periodSeconds: 10
+    # timeoutSeconds: 1
+  readinessProbe:
+    grpc:
+      port: 8082
+    initialDelaySeconds: 5
+    failureThreshold: 10
+    # periodSeconds: 10
+    # timeoutSeconds: 1
+    # successThreshold: 1
+
+  serviceAccount:
+    # Specifies whether a service account should be created.
+    # We create this by default to make it easier for downstream users to apply PodSecurityPolicies.
+    create: true
+    # Annotations to add to the service account
+    annotations: {}
+    # The name of the service account to use.
+    # If not set and create is true, a name is generated using the fullname template
+    name:
+
+  # specify how many old ControllerRevisions for the DaemonSet to retain.
+  revisionHistoryLimit:
+
+  rbac:
+    create: true
+
   # Allow users to mount the hostPath /usr/src, useful for RHCOS on s390x
   # Does not work on systems without /usr/src AND a read-only /usr, such as Talos
   mountUsrSrc: false
 
-  resources: {}
-    # We usually recommend not to specify default resources and to leave this as a conscious
-    # choice for the user. This also increases chances charts run on environments with little
-    # resources, such as Minikube. If you do want to specify resources, uncomment the following
-    # lines, adjust them as necessary, and remove the curly braces after 'resources:'.
-    # limits:
-    #   cpu: 100m
-    #   memory: 128Mi
-    # requests:
-    #   cpu: 100m
-    #   memory: 128Mi
+  resources:
+    limits:
+      memory: 512Mi
+    requests:
+      cpu: 5m
+      memory: 64Mi
 
   nodeSelector: {}
 
@@ -350,21 +480,43 @@ worker:
 
   affinity: {}
 
+  priorityClassName: ""
+
 topologyUpdater:
+  config: ### <NFD-TOPOLOGY-UPDATER-CONF-START-DO-NOT-REMOVE>
+    ## key = node name, value = list of resources to be excluded.
+    ## use * to exclude from all nodes.
+    ## an example for how the exclude list should looks like
+    #excludeList:
+    #  node1: [cpu]
+    #  node2: [memory, example/deviceA]
+    #  *: [hugepages-2Mi]
+### <NFD-TOPOLOGY-UPDATER-CONF-END-DO-NOT-REMOVE>
+
   enable: false
   createCRDs: false
+  extraArgs: []
+  extraEnvs: []
+  hostNetwork: false
 
   serviceAccount:
-    create: false
+    create: true
     annotations: {}
     name:
-  rbac:
-    create: false
 
+  # specify how many old ControllerRevisions for the DaemonSet to retain.
+  revisionHistoryLimit:
+
+  rbac:
+    create: true
+
+  metricsPort: 8081
+  healthPort: 8082
   kubeletConfigPath:
   kubeletPodResourcesSockPath:
   updateInterval: 60s
   watchNamespace: "*"
+  kubeletStateDir: /var/lib/kubelet
 
   podSecurityContext: {}
   securityContext:
@@ -373,29 +525,74 @@ topologyUpdater:
       drop: [ "ALL" ]
     readOnlyRootFilesystem: true
     runAsUser: 0
+  
+  livenessProbe:
+    grpc:
+      port: 8082
+    initialDelaySeconds: 10
+    # failureThreshold: 3
+    # periodSeconds: 10
+    # timeoutSeconds: 1
+  readinessProbe:
+    grpc:
+      port: 8082
+    initialDelaySeconds: 5
+    failureThreshold: 10
+    # periodSeconds: 10
+    # timeoutSeconds: 1
+    # successThreshold: 1
 
-  resources: {}
-    # We usually recommend not to specify default resources and to leave this as a conscious
-    # choice for the user. This also increases chances charts run on environments with little
-    # resources, such as Minikube. If you do want to specify resources, uncomment the following
-    # lines, adjust them as necessary, and remove the curly braces after 'resources:'.
-    # limits:
-    #   cpu: 100m
-    #   memory: 128Mi
-    # requests:
-    #   cpu: 100m
-    #   memory: 128Mi
+  resources:
+    limits:
+      memory: 60Mi
+    requests:
+      cpu: 50m
+      memory: 40Mi
 
   nodeSelector: {}
   tolerations: []
   annotations: {}
+  daemonsetAnnotations: {}
+  affinity: {}
+  podSetFingerprint: true
+
+gc:
+  enable: true
+  extraArgs: []
+  extraEnvs: []
+  hostNetwork: false
+  replicaCount: 1
+
+  serviceAccount:
+    create: true
+    annotations: {}
+    name:
+  rbac:
+    create: true
+
+  interval: 1h
+
+  podSecurityContext: {}
+
+  resources:
+    limits:
+      memory: 1Gi
+    requests:
+      cpu: 10m
+      memory: 128Mi
+
+  metricsPort: 8081
+
+  nodeSelector: {}
+  tolerations: []
+  annotations: {}
+  deploymentAnnotations: {}
   affinity: {}
 
-# Optionally use encryption for worker <--> master comms
-# TODO: verify hostname is not yet supported
-#
-# If you do not enable certManager (and have it installed) you will
-# need to manually, or otherwise, provision the TLS certs as secrets
-tls:
+  # specify how many old ReplicaSets for the Deployment to retain.
+  revisionHistoryLimit:
+
+prometheus:
   enable: false
-  certManager: false
+  scrapeInterval: 10s
+  labels: {}

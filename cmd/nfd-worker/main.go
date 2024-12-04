@@ -20,12 +20,13 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"strings"
 
 	"k8s.io/klog/v2"
 
-	"sigs.k8s.io/node-feature-discovery/pkg/nfd-client/worker"
+	"sigs.k8s.io/node-feature-discovery/pkg/features"
+	worker "sigs.k8s.io/node-feature-discovery/pkg/nfd-worker"
 	"sigs.k8s.io/node-feature-discovery/pkg/utils"
+	klogutils "sigs.k8s.io/node-feature-discovery/pkg/utils/klog"
 	"sigs.k8s.io/node-feature-discovery/pkg/version"
 )
 
@@ -39,6 +40,13 @@ func main() {
 
 	printVersion := flags.Bool("version", false, "Print version and exit.")
 
+	// Add FeatureGates flag
+	if err := features.NFDMutableFeatureGate.Add(features.DefaultNFDFeatureGates); err != nil {
+		klog.ErrorS(err, "failed to add default feature gates")
+		os.Exit(1)
+	}
+	features.NFDMutableFeatureGate.AddFlag(flags)
+
 	args := parseArgs(flags, os.Args[1:]...)
 
 	if *printVersion {
@@ -48,20 +56,22 @@ func main() {
 
 	// Assert that the version is known
 	if version.Undefined() {
-		klog.Warningf("version not set! Set -ldflags \"-X sigs.k8s.io/node-feature-discovery/pkg/version.version=`git describe --tags --dirty --always`\" during build or run.")
+		klog.InfoS("version not set! Set -ldflags \"-X sigs.k8s.io/node-feature-discovery/pkg/version.version=`git describe --tags --dirty --always`\" during build or run.")
 	}
 
 	// Plug klog into grpc logging infrastructure
 	utils.ConfigureGrpcKlog()
 
 	// Get new NfdWorker instance
-	instance, err := worker.NewNfdWorker(args)
+	instance, err := worker.NewNfdWorker(worker.WithArgs(args))
 	if err != nil {
-		klog.Exitf("failed to initialize NfdWorker instance: %v", err)
+		klog.ErrorS(err, "failed to initialize NfdWorker instance")
+		os.Exit(1)
 	}
 
 	if err = instance.Run(); err != nil {
-		klog.Exit(err)
+		klog.ErrorS(err, "error while running")
+		os.Exit(1)
 	}
 }
 
@@ -84,15 +94,6 @@ func parseArgs(flags *flag.FlagSet, osArgs ...string) *worker.Args {
 			args.Overrides.FeatureSources = overrides.FeatureSources
 		case "label-sources":
 			args.Overrides.LabelSources = overrides.LabelSources
-		case "label-whitelist":
-			klog.Warningf("-label-whitelist is deprecated, use 'core.labelWhiteList' option in the config file, instead")
-			args.Overrides.LabelWhiteList = overrides.LabelWhiteList
-		case "sleep-interval":
-			klog.Warningf("-sleep-interval is deprecated, use 'core.sleepInterval' option in the config file, instead")
-			args.Overrides.SleepInterval = overrides.SleepInterval
-		case "sources":
-			klog.Warningf("-sources is deprecated, use '-label-sources' flag, instead")
-			args.Overrides.LabelSources = overrides.LabelSources
 		}
 	})
 
@@ -102,72 +103,35 @@ func parseArgs(flags *flag.FlagSet, osArgs ...string) *worker.Args {
 func initFlags(flagset *flag.FlagSet) (*worker.Args, *worker.ConfigOverrideArgs) {
 	args := &worker.Args{}
 
-	flagset.StringVar(&args.CaFile, "ca-file", "",
-		"Root certificate for verifying connections")
-	flagset.StringVar(&args.CertFile, "cert-file", "",
-		"Certificate used for authenticating connections")
 	flagset.StringVar(&args.ConfigFile, "config", "/etc/kubernetes/node-feature-discovery/nfd-worker.conf",
 		"Config file to use.")
-	flagset.StringVar(&args.KeyFile, "key-file", "",
-		"Private key matching -cert-file")
+	flagset.StringVar(&args.Kubeconfig, "kubeconfig", "",
+		"Kubeconfig to use")
 	flagset.BoolVar(&args.Oneshot, "oneshot", false,
 		"Do not publish feature labels")
+	flagset.IntVar(&args.MetricsPort, "metrics", 8081,
+		"Port on which to expose metrics.")
+	flagset.IntVar(&args.GrpcHealthPort, "grpc-health", 8082,
+		"Port on which to expose the grpc health endpoint.")
 	flagset.StringVar(&args.Options, "options", "",
 		"Specify config options from command line. Config options are specified "+
 			"in the same format as in the config file (i.e. json or yaml). These options")
-	flagset.StringVar(&args.Server, "server", "localhost:8080",
-		"NFD server address to connecto to.")
-	flagset.StringVar(&args.ServerNameOverride, "server-name-override", "",
-		"Hostname expected from server certificate, useful in testing")
 
-	initKlogFlags(flagset, args)
+	args.Klog = klogutils.InitKlogFlags(flagset)
 
 	// Flags overlapping with config file options
 	overrides := &worker.ConfigOverrideArgs{
-		LabelWhiteList: &utils.RegexpVal{},
 		FeatureSources: &utils.StringSliceVal{},
 		LabelSources:   &utils.StringSliceVal{},
 	}
 	overrides.NoPublish = flagset.Bool("no-publish", false,
-		"Do not publish discovered features, disable connection to nfd-master.")
+		"Do not publish discovered features, disable connection to nfd-master and don't create NodeFeature object.")
 	flagset.Var(overrides.FeatureSources, "feature-sources",
 		"Comma separated list of feature sources. Special value 'all' enables all sources. "+
 			"Prefix the source name with '-' to disable it.")
 	flagset.Var(overrides.LabelSources, "label-sources",
 		"Comma separated list of label sources. Special value 'all' enables all sources. "+
 			"Prefix the source name with '-' to disable it.")
-	flagset.Var(overrides.LabelWhiteList, "label-whitelist",
-		"Regular expression to filter label names to publish to the Kubernetes API server. "+
-			"NB: the label namespace is omitted i.e. the filter is only applied to the name part after '/'. "+
-			"DEPRECATED: This parameter should be set via the config file.")
-	overrides.SleepInterval = flagset.Duration("sleep-interval", 0,
-		"Time to sleep between re-labeling. Non-positive value implies no re-labeling (i.e. infinite sleep). "+
-			"DEPRECATED: This parameter should be set via the config file")
-	flagset.Var(overrides.LabelSources, "sources",
-		"Comma separated list of label sources. Special value 'all' enables all feature sources. "+
-			"Prefix the source name with '-' to disable it. "+
-			"DEPRECATED: use -label-sources instead")
 
 	return args, overrides
-}
-
-func initKlogFlags(flagset *flag.FlagSet, args *worker.Args) {
-	args.Klog = make(map[string]*utils.KlogFlagVal)
-
-	flags := flag.NewFlagSet("klog flags", flag.ContinueOnError)
-	//flags.SetOutput(ioutil.Discard)
-	klog.InitFlags(flags)
-	flags.VisitAll(func(f *flag.Flag) {
-		name := klogConfigOptName(f.Name)
-		args.Klog[name] = utils.NewKlogFlagVal(f)
-		flagset.Var(args.Klog[name], f.Name, f.Usage)
-	})
-}
-
-func klogConfigOptName(flagName string) string {
-	split := strings.Split(flagName, "_")
-	for i, v := range split[1:] {
-		split[i+1] = strings.Title(v)
-	}
-	return strings.Join(split, "")
 }

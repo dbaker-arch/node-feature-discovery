@@ -17,13 +17,16 @@ sort: 1
 
 This software enables node feature discovery for Kubernetes. It detects
 hardware features available on each node in a Kubernetes cluster, and
-advertises those features using node labels.
+advertises those features using node labels and optionally node extended
+resources, annotations and node taints. Node Feature Discovery is compatible
+with any recent version of Kubernetes (v1.24+).
 
-NFD consists of three software components:
+NFD consists of four software components:
 
 1. nfd-master
 1. nfd-worker
 1. nfd-topology-updater
+1. nfd-gc
 
 ## NFD-Master
 
@@ -42,10 +45,18 @@ instance of nfd-worker is supposed to be running on each node of the cluster,
 NFD-Topology-Updater is a daemon responsible for examining allocated
 resources on a worker node to account for resources available to be allocated
 to new pod on a per-zone basis (where a zone can be a NUMA node). It then
-communicates the information to nfd-master which does the
-[NodeResourceTopology CR](#noderesourcetopology-cr) creation corresponding
-to all the nodes in the cluster. One instance of nfd-topology-updater is
+creates or updates a
+[NodeResourceTopology](../usage/custom-resources.md#noderesourcetopology) custom
+resource object specific to this node. One instance of nfd-topology-updater is
 supposed to be running on each node of the cluster.
+
+## NFD-GC
+
+NFD-GC is a daemon responsible for cleaning obsolete
+[NodeFeature](../usage/custom-resources.md#nodefeature) and
+[NodeResourceTopology](../usage/custom-resources.md#noderesourcetopology) objects.
+
+One instance of nfd-gc is supposed to be running in the cluster.
 
 ## Feature Discovery
 
@@ -60,8 +71,7 @@ Feature discovery is divided into domain-specific feature sources:
 - System
 - USB
 - Custom (rule-based custom features)
-- Local (hooks for user-specific features)
-- IOMMU (*deprecated*)
+- Local (features files)
 
 Each feature source is responsible for detecting a set of features which. in
 turn, are turned into node feature labels.  Feature labels are prefixed with
@@ -90,62 +100,31 @@ An overview of the default feature labels:
 
 NFD also annotates nodes it is running on:
 
-| Annotation                                                   | Description
-| ------------------------------------------------------------ | -----------
-| [&lt;instance&gt;.]nfd.node.kubernetes.io/master.version     | Version of the nfd-master instance running on the node. Informative use only.
-| [&lt;instance&gt;.]nfd.node.kubernetes.io/worker.version     | Version of the nfd-worker instance running on the node. Informative use only.
-| [&lt;instance&gt;.]nfd.node.kubernetes.io/feature-labels     | Comma-separated list of node labels managed by NFD. NFD uses this internally so must not be edited by users.
-| [&lt;instance&gt;.]nfd.node.kubernetes.io/extended-resources | Comma-separated list of node extended resources managed by NFD. NFD uses this internally so must not be edited by users.
+| Annotation                                                    | Description                                                 |
+| ------------------------------------------------------------- | ----------------------------------------------------------- |
+| [&lt;instance&gt;.]nfd.node.kubernetes.io/feature-labels      | Comma-separated list of node labels managed by NFD. NFD uses this internally so must not be edited by users. |
+| [&lt;instance&gt;.]nfd.node.kubernetes.io/feature-annotations | Comma-separated list of node annotations managed by NFD. NFD uses this internally so must not be edited by users. |
+| [&lt;instance&gt;.]nfd.node.kubernetes.io/extended-resources  | Comma-separated list of node extended resources managed by NFD. NFD uses this internally so must not be edited by users. |
+| [&lt;instance&gt;.]nfd.node.kubernetes.io/taints              | Comma-separated list of node taints managed by NFD. NFD uses this internally so must not be edited by users. |
 
-NOTE: the [`-instance`](../advanced/master-commandline-reference.md#instance)
-command line flag affects the annotation names
+> **NOTE:** the [`-instance`](../reference/master-commandline-reference.md#instance)
+> command line flag affects the annotation names
 
-Unapplicable annotations are not created, i.e. for example master.version is
-only created on nodes running nfd-master.
+Unapplicable annotations are not created, i.e. for example
+`nfd.node.kubernetes.io/extended-resources` is only placed if some extended
+resources were created by NFD.
 
-## NodeResourceTopology CR
+## Custom resources
 
-When run with NFD-Topology-Updater, NFD creates CR instances corresponding to
-node resource hardware topology such as:
+NFD takes use of some Kubernetes Custom Resources.
 
- ```yaml
-apiVersion: topology.node.k8s.io/v1alpha1
-kind: NodeResourceTopology
-metadata:
-  name: node1
-topologyPolicies: ["SingleNUMANodeContainerLevel"]
-zones:
-  - name: node-0
-    type: Node
-    resources:
-      - name: cpu
-        capacity: 20
-        allocatable: 16
-        available: 10
-      - name: vendor/nic1
-        capacity: 3
-        allocatable: 3
-        available: 3
-  - name: node-1
-    type: Node
-    resources:
-      - name: cpu
-        capacity: 30
-        allocatable: 30
-        available: 15
-      - name: vendor/nic2
-        capacity: 6
-        allocatable: 6
-        available: 6
-  - name: node-2
-    type: Node
-    resources:
-      - name: cpu
-        capacity: 30
-        allocatable: 30
-        available: 15
-      - name: vendor/nic1
-        capacity: 3
-        allocatable: 3
-        available: 3
- ```
+[NodeFeature](../usage/custom-resources.md#nodefeature)s
+is be used for representing node features and requesting node labels to be
+generated.
+
+NFD-Master uses [NodeFeatureRule](../usage/custom-resources.md#nodefeaturerule)s
+for custom labeling of nodes.
+
+NFD-Topology-Updater creates
+[NodeResourceTopology](../usage/custom-resources.md#noderesourcetopology) objects
+that describe the hardware topology of node resources.

@@ -1,5 +1,5 @@
-//go:build !amd64
-// +build !amd64
+//go:build !(amd64 && linux)
+// +build !amd64 !linux
 
 /*
 Copyright 2018 The Kubernetes Authors.
@@ -19,6 +19,6 @@ limitations under the License.
 
 package cpu
 
-func discoverRDT() []string {
-	return []string{}
+func discoverRDT() map[string]string {
+	return map[string]string{}
 }

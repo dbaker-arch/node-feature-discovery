@@ -19,71 +19,83 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net"
 	"os"
+	"path"
+	"strings"
 	"time"
 
 	"k8s.io/klog/v2"
 
-	"sigs.k8s.io/node-feature-discovery/pkg/kubeconf"
-	topology "sigs.k8s.io/node-feature-discovery/pkg/nfd-client/topology-updater"
+	topology "sigs.k8s.io/node-feature-discovery/pkg/nfd-topology-updater"
 	"sigs.k8s.io/node-feature-discovery/pkg/resourcemonitor"
-	"sigs.k8s.io/node-feature-discovery/pkg/topologypolicy"
 	"sigs.k8s.io/node-feature-discovery/pkg/utils"
+	"sigs.k8s.io/node-feature-discovery/pkg/utils/hostpath"
 	"sigs.k8s.io/node-feature-discovery/pkg/version"
-	"sigs.k8s.io/node-feature-discovery/source"
 )
 
 const (
 	// ProgramName is the canonical name of this program
-	ProgramName = "nfd-topology-updater"
+	ProgramName       = "nfd-topology-updater"
+	kubeletSecurePort = 10250
 )
+
+var DefaultKubeletStateDir = path.Join(string(hostpath.VarDir), "lib", "kubelet")
 
 func main() {
 	flags := flag.NewFlagSet(ProgramName, flag.ExitOnError)
 
-	printVersion := flags.Bool("version", false, "Print version and exit.")
-
 	args, resourcemonitorArgs := parseArgs(flags, os.Args[1:]...)
-
-	if *printVersion {
-		fmt.Println(ProgramName, version.Get())
-		os.Exit(0)
-	}
 
 	// Assert that the version is known
 	if version.Undefined() {
-		klog.Warningf("version not set! Set -ldflags \"-X sigs.k8s.io/node-feature-discovery/pkg/version.version=`git describe --tags --dirty --always`\" during build or run.")
+		klog.InfoS("version not set! Set -ldflags \"-X sigs.k8s.io/node-feature-discovery/pkg/version.version=`git describe --tags --dirty --always`\" during build or run.")
 	}
 
 	// Plug klog into grpc logging infrastructure
 	utils.ConfigureGrpcKlog()
 
-	klConfig, err := kubeconf.GetKubeletConfigFromLocalFile(resourcemonitorArgs.KubeletConfigFile)
-	if err != nil {
-		klog.Exitf("error reading kubelet config: %v", err)
-	}
-	tmPolicy := string(topologypolicy.DetectTopologyPolicy(klConfig.TopologyManagerPolicy, klConfig.TopologyManagerScope))
-	klog.Infof("detected kubelet Topology Manager policy %q", tmPolicy)
-
 	// Get new TopologyUpdater instance
-	instance, err := topology.NewTopologyUpdater(*args, *resourcemonitorArgs, tmPolicy)
+	instance, err := topology.NewTopologyUpdater(*args, *resourcemonitorArgs)
 	if err != nil {
-		klog.Exitf("failed to initialize TopologyUpdater instance: %v", err)
+		klog.ErrorS(err, "failed to initialize topology updater instance")
+		os.Exit(1)
 	}
 
 	if err = instance.Run(); err != nil {
-		klog.Exit(err)
+		klog.ErrorS(err, "error while running")
+		os.Exit(1)
 	}
 }
 
 func parseArgs(flags *flag.FlagSet, osArgs ...string) (*topology.Args, *resourcemonitor.Args) {
 	args, resourcemonitorArgs := initFlags(flags)
+	printVersion := flags.Bool("version", false, "Print version and exit.")
 
 	_ = flags.Parse(osArgs)
 	if len(flags.Args()) > 0 {
 		fmt.Fprintf(flags.Output(), "unknown command line argument: %s\n", flags.Args()[0])
 		flags.Usage()
 		os.Exit(2)
+	}
+
+	if *printVersion {
+		fmt.Println(ProgramName, version.Get())
+		os.Exit(0)
+	}
+
+	if len(resourcemonitorArgs.KubeletConfigURI) == 0 {
+		nodeAddress := os.Getenv("NODE_ADDRESS")
+		if len(nodeAddress) == 0 {
+			fmt.Fprintf(flags.Output(), "unable to determine the default kubelet config endpoint 'https://${NODE_ADDRESS}:%d/configz' due to empty NODE_ADDRESS environment, "+
+				"please either define the NODE_ADDRESS environment variable or specify endpoint with the -kubelet-config-uri flag\n", kubeletSecurePort)
+			os.Exit(1)
+		}
+		if isIPv6(nodeAddress) {
+			// With IPv6 we need to wrap the IP address in brackets as we append :port below
+			nodeAddress = "[" + nodeAddress + "]"
+		}
+		resourcemonitorArgs.KubeletConfigURI = fmt.Sprintf("https://%s:%d/configz", nodeAddress, kubeletSecurePort)
 	}
 
 	return args, resourcemonitorArgs
@@ -93,32 +105,37 @@ func initFlags(flagset *flag.FlagSet) (*topology.Args, *resourcemonitor.Args) {
 	args := &topology.Args{}
 	resourcemonitorArgs := &resourcemonitor.Args{}
 
-	flagset.StringVar(&args.CaFile, "ca-file", "",
-		"Root certificate for verifying connections")
-	flagset.StringVar(&args.CertFile, "cert-file", "",
-		"Certificate used for authenticating connections")
-	flagset.StringVar(&args.KeyFile, "key-file", "",
-		"Private key matching -cert-file")
 	flagset.BoolVar(&args.Oneshot, "oneshot", false,
 		"Update once and exit")
 	flagset.BoolVar(&args.NoPublish, "no-publish", false,
-		"Do not publish discovered features to the cluster-local Kubernetes API server.")
+		"Do not create or update NodeResourceTopology objects.")
 	flagset.StringVar(&args.KubeConfigFile, "kubeconfig", "",
 		"Kube config file.")
+	flagset.IntVar(&args.MetricsPort, "metrics", 8081,
+		"Port on which to expose metrics.")
+	flagset.IntVar(&args.GrpcHealthPort, "grpc-health", 8082,
+		"Port on which to expose the grpc health endpoint.")
 	flagset.DurationVar(&resourcemonitorArgs.SleepInterval, "sleep-interval", time.Duration(60)*time.Second,
-		"Time to sleep between CR updates. Non-positive value implies no CR updatation (i.e. infinite sleep). [Default: 60s]")
+		"Time to sleep between CR updates. zero means no CR updates on interval basis. [Default: 60s]")
 	flagset.StringVar(&resourcemonitorArgs.Namespace, "watch-namespace", "*",
 		"Namespace to watch pods (for testing/debugging purpose). Use * for all namespaces.")
-	flagset.StringVar(&resourcemonitorArgs.KubeletConfigFile, "kubelet-config-file", source.VarDir.Path("lib/kubelet/config.yaml"),
-		"Kubelet config file path.")
-	flagset.StringVar(&resourcemonitorArgs.PodResourceSocketPath, "podresources-socket", source.VarDir.Path("lib/kubelet/pod-resources/kubelet.sock"),
+	flagset.StringVar(&resourcemonitorArgs.KubeletConfigURI, "kubelet-config-uri", "",
+		"Kubelet config URI path. Default to kubelet configz endpoint.")
+	flagset.StringVar(&resourcemonitorArgs.APIAuthTokenFile, "api-auth-token-file", "/var/run/secrets/kubernetes.io/serviceaccount/token",
+		"API auth token file path. It is used to request kubelet configz endpoint, only takes effect when kubelet-config-uri is https. Default to /var/run/secrets/kubernetes.io/serviceaccount/token.")
+	flagset.StringVar(&resourcemonitorArgs.PodResourceSocketPath, "podresources-socket", hostpath.VarDir.Path("lib/kubelet/pod-resources/kubelet.sock"),
 		"Pod Resource Socket path to use.")
-	flagset.StringVar(&args.Server, "server", "localhost:8080",
-		"NFD server address to connecto to.")
-	flagset.StringVar(&args.ServerNameOverride, "server-name-override", "",
-		"Hostname expected from server certificate, useful in testing")
+	flagset.StringVar(&args.ConfigFile, "config", "/etc/kubernetes/node-feature-discovery/nfd-topology-updater.conf",
+		"Config file to use.")
+	flagset.BoolVar(&resourcemonitorArgs.PodSetFingerprint, "pods-fingerprint", true, "Compute and report the pod set fingerprint")
+	flagset.StringVar(&args.KubeletStateDir, "kubelet-state-dir", DefaultKubeletStateDir, "Kubelet state directory path for watching state and checkpoint files")
 
 	klog.InitFlags(flagset)
 
 	return args, resourcemonitorArgs
+}
+
+func isIPv6(addr string) bool {
+	ip := net.ParseIP(addr)
+	return ip != nil && strings.Count(ip.String(), ":") >= 2
 }

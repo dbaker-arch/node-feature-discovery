@@ -6,11 +6,26 @@ spec:
   rules:
     - name: "my sample rule"
       labels:
-        "my-sample-feature": "true"
+        "vendor.io/my-sample-feature": "true"
       matchFeatures:
         - feature: kernel.loadedmodule
           matchExpressions:
-            dummy: {op: Exists}
+            dummy: { op: Exists }
         - feature: kernel.config
           matchExpressions:
-            X86: {op: In, value: ["y"]}
+            X86: { op: In, value: ["y"] }
+---
+apiVersion: nfd.k8s-sigs.io/v1alpha1
+kind: NodeFeatureRule
+metadata:
+  name: my-sample-extened-resource
+spec:
+  rules:
+    - name: "my sample rule"
+      extendedResources:
+        vendor.io/dynamic: "@kernel.version.major"
+        vendor.io/static: "123"
+      matchFeatures:
+        - feature: kernel.version
+          matchExpressions:
+            major: { op: Exists }
